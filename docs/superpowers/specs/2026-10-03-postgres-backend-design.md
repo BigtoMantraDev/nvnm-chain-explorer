@@ -49,8 +49,11 @@ Made in brainstorming on 2026-10-03:
    as they are: moved, not rewritten.
 8. **Versioned migrations on both backends**, run by the indexer under the
    lock. Existing SQLite files are adopted.
-9. **The first production Postgres is re-indexed from the chain.** There is
-   no SQLite importer.
+9. **The first production Postgres is re-indexed from the chain, side by
+   side.** New `explorer-indexer` and `explorer-web` deployments sync
+   against Postgres while today's deployment keeps serving from SQLite.
+   Devops switches traffic once the indexer reports synced. Each process
+   connects to exactly one database, and there is no SQLite importer.
 10. **Integration tests compare the baseline fixtures on Postgres too.**
 
 ### What this phase delivers
@@ -72,8 +75,8 @@ Made in brainstorming on 2026-10-03:
 - **Tests on both backends.** The existing suites run on both, the baseline
   fixtures are replayed and re-indexed into Postgres, and the two backends
   are compared with each other.
-- **Operations.** Kubernetes manifests, a runbook, and a cutover tool with a
-  stop-at-height control.
+- **Operations.** Kubernetes manifests, a runbook, and a side-by-side
+  cutover gated on the indexer's own "synced" report.
 
 ## 1. Sync vs async
 
@@ -147,7 +150,6 @@ becomes the fallback.
 | `src/follow.rs`                                           | The web-role polling follower: live blocks, stats, schema gate, label-cache refresh                                                                                                                                  | ~150             |
 | `migrations/postgres/0001_baseline.sql`                   | `src/db/schema_pg.sql`, moved; `idx_tb_holding` gains `holder_addr`                                                                                                                                                  | moved            |
 | `migrations/{sqlite,postgres}/NNNN_name.sql`              | Schema changes from 0002 on                                                                                                                                                                                          | —                |
-| `tests/cutover.rs`                                        | `#[ignore]`d cutover comparison (section 10)                                                                                                                                                                         | ~250             |
 | `deploy/k8s/`                                             | Manifests, secrets template and README (section 8)                                                                                                                                                                   | —                |
 
 The module root is `src/db/mod.rs`, not a new `src/db.rs`. Deleting
@@ -1035,11 +1037,12 @@ flowchart LR
   because Postgres is unreachable. A background task evaluates the schema
   gate.
 - **`/readyz`.** It reports
-  `{role, schema: {db, binary, required}, writer, preflight}` from a status
-  `watch` created before `open_with`. It **never acquires a pool
-  connection**. It returns 200 when:
+  `{role, schema: {db, binary, required}, writer, preflight}`, plus `sync`
+  on the indexer (section 10), from a status `watch` created before
+  `open_with`. It **never acquires a pool connection**. It returns 200
+  when:
   - **indexer:** the preflight passed, whether the writer is a candidate,
-    leader or reacquiring;
+    leader or reacquiring. Sync progress never affects readiness;
   - **web:** the latched schema gate passed, and SIGTERM has not arrived.
 
   Database health shows in the JSON body and in metrics. Pool exhaustion
@@ -1304,7 +1307,7 @@ Each stage is a PR that merges with CI green.
 | 4b               | `plan.rs` and its property test. Set-based `save_block_bundle(s)`. Two-pass anchoring. Replay and differential. **Spike gate:** at most 14 round trips per batch, and equal tables on `canary-rich`; otherwise stop and reassess before 4c                                                                                                                                                                                                             | —                                  |
 | 4c               | Genesis, stats, repair and rebuilds (on the `Long` budget). `try_min_block_number` in `backfill_loop`. The missing-metadata job. The `TEST_DB=postgres` job and the coverage gate. Postgres becomes selectable                                                                                                                                                                                                                                         | —                                  |
 | 5                | `ROLE=web` and `ROLE=indexer`. The follower. The 503 middleware and `exec_best_effort`. The web schema gate. In `indexer.rs`: the writer-loop `keepalive` and exit codes 3, 4 and 5. Bind-before-open and lock-free `/readyz`                                                                                                                                                                                                                          | Default `all` unchanged            |
-| 6                | `DbUrl`. `deploy/k8s/`. The runbook. `docs/database.md`. The live Postgres baseline in CI, and the nightly PG 15 job. `INDEX_STOP_AT` and `tests/cutover.rs`                                                                                                                                                                                                                                                                                           | —                                  |
+| 6                | `DbUrl`. `deploy/k8s/`. The runbook, with the cutover checklist. `docs/database.md`. The live Postgres baseline in CI, and the nightly PG 15 job. The indexer's `sync` status in `/readyz`                                                                                                                                                                                                                                                             | —                                  |
 | 7 (optional)     | `tokio::join!` of independent Postgres page queries                                                                                                                                                                                                                                                                                                                                                                                                    | SQLite unchanged                   |
 
 **Coordinating with teammates**
@@ -1317,55 +1320,109 @@ Each stage is a PR that merges with CI green.
   `docs/database.md`. In-flight PRs that edit `init_db` are rewritten as
   migration pairs.
 
-**Cutover** (decision 9: re-index from the chain):
+**Cutover: side by side** (decision 9)
 
-1. **Re-index.** Deploy the Postgres indexer against an empty database,
-   alongside the running SQLite production. Inferred: about 2–3 h for the
-   roughly 1.6M blocks, limited by the RPC (about 200 blocks/s,
-   `README.md:123`) once writes are set-based. Wait until backfill
-   completes (`MIN(number) = 1`) and the genesis cursor has caught up.
-2. **Pin a common height H.**
-   - Take an online snapshot of production with
-     `sqlite3 explorer.db ".backup snap.db"`.
-   - Let H be the snapshot's max block. Check that its blocks are
-     contiguous up to H.
-   - Restart the Postgres indexer with `INDEX_STOP_AT=H`. It commits
-     through H, then stops forward indexing while keeping the lock.
-3. **Normalize.** Run `sync_holder_counts` on `snap.db`. This removes
-   `holder_count` drift caused by SQLite's web-insert race.
-4. **Compare.** `tests/cutover.rs` (`#[ignore]`; reads `SQLITE_PATH` and
-   `PG_URL`) uses the baseline rules, `SPECS` and `NOT_INDEXED`, not the
-   section 9 differential:
-   - skip `trace_data`, `total_supply`, `id`, `created_at` and `updated_at`;
-   - exclude `kv`, `selector_names` and `sqlite_sequence` entirely;
-   - limit `token_metadata` to addresses that `transfer_events.token_addr`
-     or `transactions.fee_token` reference in blocks ≤ H;
-   - compare every other table exactly at H, including `token_balances`,
-     `holder_count` and `counters`.
-5. **Go** when the comparison is equal and the measured page p95 is
-   acceptable. Unset `INDEX_STOP_AT`, let Postgres catch up, then switch
-   traffic to the web deployment. `trace_data` and `selector_names` start
-   empty and refill on page views.
-6. **Fallback.** Keep the SQLite deployment running for 7 days.
+The Postgres stack is built next to production and synced from the chain,
+then traffic moves to it. Every process connects to exactly one database,
+and no tool reads both.
+
+```mermaid
+flowchart LR
+    users(["Users"])
+    rpc(["Chain RPC"])
+    subgraph cur_dep["Current deployment, unchanged"]
+        cur["today's image"] --> lite[("SQLite file")]
+    end
+    subgraph new_dep["New deployments"]
+        idx["explorer-indexer<br/>ROLE=indexer"] --> pg[("Postgres")]
+        web["explorer-web<br/>ROLE=web"] --> pg
+    end
+    users -->|"until the switch"| cur
+    users -.->|"after the switch"| web
+    rpc --> cur
+    rpc --> idx
+```
+
+1. **Leave production as it is.** The current deployment keeps its image,
+   its SQLite file and all traffic. The new code reaches production only
+   through the two new deployments, so it never opens the production
+   SQLite file.
+2. **Deploy `explorer-indexer`** against an empty database. It passes the
+   preflight, takes the lock, applies the migrations from v1, and
+   re-indexes: forward from the head, backfill down to block 1, and the
+   genesis, anchoring and missing-metadata jobs. Inferred: about 2–3 h for
+   the roughly 1.6M blocks, limited by the RPC. That load lands on the node
+   production also uses; point `NVNM_RPC` at a separate node if that one
+   has little headroom.
+3. **Deploy `explorer-web`** at any time after that. Its pods turn Ready
+   once the indexer has applied the migrations (the schema gate), and get
+   no public traffic until the switch. Pages show partial history until
+   backfill completes. Reach them through a port-forward or an internal
+   host to measure page p95.
+4. **Wait until the indexer reports synced.** The indexer's `/readyz` body
+   carries a `sync` object. Reading it never touches the database:
+
+   ```json
+   "sync": {"lowest_block": 1, "tip_lag": 0, "genesis": true, "anchoring": true, "complete": true}
+   ```
+
+   - `lowest_block`: the lowest committed block, as the backfill loop last
+     read it from the database. The loop re-reads it there once it reaches
+     block 1 (`indexer.rs:896-902`).
+   - `tip_lag`: how far the forward loop is behind the chain head.
+   - `genesis`: a genesis pass that started after `lowest_block` reached 1
+     found no holder left.
+   - `anchoring`: the anchoring backfill finished. It runs once per start
+     (`indexer.rs:986-993`), so a failed run leaves this false until the
+     indexer restarts, which surfaces a failure that today only logs a
+     warning.
+   - `complete`: `lowest_block` is 1, `tip_lag` is at most 16
+     (`TIP_YIELD_LAG`, the lag at which backfill already yields to the
+     head), and `genesis` and `anchoring` are true.
+5. **Go/no-go,** checked by devops just before the switch:
+   - `sync.complete` is true;
+   - `blocks` has no holes. This returns true, run with the web user's
+     read-only credentials:
+     `SELECT MIN(number) = 1 AND COUNT(*) = MAX(number) FROM blocks;`
+     A hole means a block was dropped as a `Data` error and logged as
+     "block N not written" (`indexer.rs:1033`). Investigate before
+     switching;
+   - the measured page p95 is acceptable;
+   - a spot check: a few old blocks, transactions, addresses and tokens
+     show the same data on both deployments.
+6. **Switch.** Devops moves traffic (DNS or Ingress) to `explorer-web`.
+   `trace_data` and `selector_names` start empty and refill on page views.
+7. **Fallback.** Keep the current deployment running, and indexing, for
+   7 days. Rolling back is the reverse switch, and no data moves in either
+   direction. Then retire it with its SQLite file.
+
+**No row-by-row comparison with production.** Nothing reads the production
+SQLite file and Postgres together, so there is no snapshot, pinned height or
+stop-at-height control. Correctness rests on section 9's tests (fixture
+replay, the differential, the live canary re-index and the parity grid), the
+hole check and the spot check, with the current deployment as the fallback.
+
+**After the switch,** every release follows section 5's deploy order:
+`explorer-indexer` first, then `explorer-web`.
 
 ## 11. Costs
 
 **One-time** (estimates; the merge probe and the census measured the
 caller and SQLite counts):
 
-| Item                                                              | Lines                                                            |
-|-------------------------------------------------------------------|------------------------------------------------------------------|
-| Existing SQLite code                                              | −3/+6, plus a few in `schema_check.rs` when SQLite 0002 lands    |
-| Callers (`.await` codemod)                                        | 360–400                                                          |
-| Stage-0 prep                                                      | 70–120                                                           |
-| `db/mod.rs`, label cache, hooks, seal                             | ~450                                                             |
-| SQLite runner, `extra.rs`, pins, guard                            | ~200                                                             |
-| Shared migration list and gate                                    | ~220                                                             |
-| Postgres backend (reads, writes, writer, runner)                  | 2,400–2,700                                                      |
-| Follower, `ROLE`, config, health, 503 middleware, `INDEX_STOP_AT` | ~400                                                             |
-| Tests, including `cutover.rs`                                     | 2,100–2,400                                                      |
-| CI YAML                                                           | ~100                                                             |
-| **Total code**                                                    | **~6,300–7,000**, plus ~400 lines of manifests, runbook and docs |
+| Item                                                             | Lines                                                            |
+|------------------------------------------------------------------|------------------------------------------------------------------|
+| Existing SQLite code                                             | −3/+6, plus a few in `schema_check.rs` when SQLite 0002 lands    |
+| Callers (`.await` codemod)                                       | 360–400                                                          |
+| Stage-0 prep                                                     | 70–120                                                           |
+| `db/mod.rs`, label cache, hooks, seal                            | ~450                                                             |
+| SQLite runner, `extra.rs`, pins, guard                           | ~200                                                             |
+| Shared migration list and gate                                   | ~220                                                             |
+| Postgres backend (reads, writes, writer, runner)                 | 2,400–2,700                                                      |
+| Follower, `ROLE`, config, health and sync status, 503 middleware | ~400                                                             |
+| Tests                                                            | 1,850–2,150                                                      |
+| CI YAML                                                          | ~100                                                             |
+| **Total code**                                                   | **~6,050–6,750**, plus ~400 lines of manifests, runbook and docs |
 
 **Recurring:**
 
@@ -1382,17 +1439,18 @@ backends always compile, so clippy always checks both.
 
 ## 12. Risks and what to measure first
 
-| Risk                                                                        | Containment                                                                                                                                                     |
-|-----------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| The two SQL sets drift                                                      | A missing twin does not compile; the parity grid and coverage gate; the differential; the `TEST_DB` matrix; the constant-equality test; the Postgres SQL lint   |
-| Set-based results differ from per-row                                       | The planner property test, with SQLite as the reference; the differential with shuffled and duplicated batches; the rebuild pass in replay                      |
-| A partial commit or a silent lock loss                                      | Spawned, cancel-safe writes; the session fence; `try_lock` required to re-acquire; the self-checks; lock and cancel tests                                       |
-| Blocks lost on failover, on a database error, or on an asynchronous replica | `Unavailable` is the default class and is retried; `writer_seq` with run id and exit 4; fallible frontier reads; the container-restart and injected-error tests |
-| Orphan sessions holding the lock                                            | The lease, `tcp_user_timeout`, `client_connection_check_interval`, terminating the recorded pid, and the watchdog                                               |
-| A deploy deadlock, a broken image, or version skew                          | Probes never wait on the lock; the indexer preflight gates readiness; `web_safe_from`; indexer-first deploys                                                    |
-| Teammates edit `init_db` or a merged migration                              | Pins A and B; the CI immutability step; runtime checksums                                                                                                       |
-| The commute rule proves too restrictive                                     | Stub patterns, two-release index changes, and the section 5 escape hatch                                                                                        |
-| sqlx 0.9.0 is new                                                           | Pinned to `=0.9.0`; MSRV 1.94                                                                                                                                   |
+| Risk                                                                        | Containment                                                                                                                                                                   |
+|-----------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| The two SQL sets drift                                                      | A missing twin does not compile; the parity grid and coverage gate; the differential; the `TEST_DB` matrix; the constant-equality test; the Postgres SQL lint                 |
+| Set-based results differ from per-row                                       | The planner property test, with SQLite as the reference; the differential with shuffled and duplicated batches; the rebuild pass in replay                                    |
+| A partial commit or a silent lock loss                                      | Spawned, cancel-safe writes; the session fence; `try_lock` required to re-acquire; the self-checks; lock and cancel tests                                                     |
+| Blocks lost on failover, on a database error, or on an asynchronous replica | `Unavailable` is the default class and is retried; `writer_seq` with run id and exit 4; fallible frontier reads; the container-restart and injected-error tests               |
+| Orphan sessions holding the lock                                            | The lease, `tcp_user_timeout`, `client_connection_check_interval`, terminating the recorded pid, and the watchdog                                                             |
+| A deploy deadlock, a broken image, or version skew                          | Probes never wait on the lock; the indexer preflight gates readiness; `web_safe_from`; indexer-first deploys                                                                  |
+| A divergence that only production data shows                                | Section 9's tests (replay, differential, the live canary re-index, the grid); the cutover's hole check and spot check; the current deployment kept for 7 days as the fallback |
+| Teammates edit `init_db` or a merged migration                              | Pins A and B; the CI immutability step; runtime checksums                                                                                                                     |
+| The commute rule proves too restrictive                                     | Stub patterns, two-release index changes, and the section 5 escape hatch                                                                                                      |
+| sqlx 0.9.0 is new                                                           | Pinned to `=0.9.0`; MSRV 1.94                                                                                                                                                 |
 
 **Measure before committing past stage 4b:**
 
@@ -1469,5 +1527,5 @@ The phase is done when:
 6. A deployed SQLite file opened by the new binary is adopted and stamped
    v1, with its rows and shape unchanged, and today's binary can still open
    it.
-7. The cutover comparison at a pinned common height H (section 10) shows
-   equal results.
+7. A full re-index into the chosen target reaches `sync.complete` with no
+   holes in `blocks` (section 10).
