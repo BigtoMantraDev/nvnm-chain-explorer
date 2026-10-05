@@ -99,6 +99,29 @@ Made in brainstorming on 2026-10-03:
   cutover gated on the indexer's own "synced" report and a per-page p95
   bound.
 
+### Known limitations
+
+**A token with no transfers yet is not listed or searchable in the split
+deployment.** Status: open. The owner decides, after this spec is reviewed,
+whether to accept it or bring the fix into this phase.
+
+- **Today** a page view of a token saves its metadata (`web.rs:1567`). From
+  then on the token is in `/tokens`, in search, and labels its address on
+  other pages.
+- **Under `ROLE=web`** the web replicas write no chain data (section 6).
+  The indexer learns of a token only from a `Transfer` in a block or from a
+  fee paid in it (`indexer.rs:270-295`). A mint counts, because it is a
+  `Transfer` from the zero address.
+- **So between a token's creation and its first mint, transfer or fee
+  use,** its page still renders, from one RPC fetch per view, but it is
+  missing from `/tokens`, from search and from labels on other pages.
+  Opening its page does not change that.
+- **`ROLE=all` keeps today's behaviour** on either backend, because its
+  page views still save through the writer.
+- **The fix** is to discover tokens from the TIP-20 factory's
+  `TokenCreated` logs. It is outside this phase for now (section 14).
+- **Users are told** in `README.md`, in stage 8 (section 10).
+
 ## 1. Sync vs async
 
 **Decision: a native async `db::*` API. The SQLite arm calls the moved
@@ -191,8 +214,9 @@ enum Backend { Sqlite(sqlite::Db), Postgres(Box<pg::PgDb>) } // Box: clippy larg
 #[derive(Clone, Copy)]
 pub enum Role { All, Web, Indexer }
 
-/// Every test's call text still works: `postgres://` or `postgresql://`
-/// picks Postgres, anything else is a SQLite path. Role::All.
+/// Every test's call text still works. A Postgres URL, with or without its
+/// scheme (`localhost:5432` counts, section 7), picks Postgres; anything
+/// else is a SQLite path. Role::All.
 pub async fn open(path_or_url: &str) -> anyhow::Result<Db>;
 /// main.rs: role, URL, TLS material, and the status channel /readyz reads.
 pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> anyhow::Result<Db>;
@@ -996,8 +1020,9 @@ operator.
     repair. Under `ROLE=all`, page views still repair them, as today.
   - `repair_token_metadata` only re-fetches existing rows
     (`indexer.rs:611-620`).
-- **Accepted split-mode divergence.** Under `ROLE=web`, a token with no
-  transfer and no fee use gets no row from a page view. Each view renders
+- **Split-mode divergence (open; see "Known limitations").** Under
+  `ROLE=web`, a token with no transfer and no fee use gets no row from a
+  page view. Each view renders
   it from one RPC fetch, the same cost as an unknown address today. It is
   not listed or searchable until its first transfer is indexed. Discovering
   such tokens from TIP-20 factory `TokenCreated` logs is a possible
@@ -1012,21 +1037,84 @@ operator.
 
 ## 7. Postgres targets: Cloud SQL and Kubernetes
 
-**Configuration** is one libpq-style `DATABASE_URL`, with `sslmode` and
-`sslrootcert=/path` (sqlx parses both), plus `ROLE`. `DB_PATH` stays the
-SQLite setting, and `DATABASE_URL` wins when it is set. The Fly app, Render
+**Configuration.** `DATABASE_URL` selects Postgres and carries the host,
+port, database and TLS parameters (`sslmode` and `sslrootcert=/path`, which
+sqlx parses). In production it carries no credentials: the user and the
+password are the separate variables `PGUSER` and `PGPASSWORD`, so the
+password can be injected into the pod from Secret Manager without any URL
+holding it. `ROLE` picks the role. `DB_PATH` stays the SQLite setting, and
+`DATABASE_URL` wins when it is set. The Fly app, Render
 and the systemd unit set only `DB_PATH` (`fly.toml:15`, `render.yaml:16`,
 `deploy/nvnmchain-explorer.service:12`), and a test checks that `DB_PATH`
 alone still opens the file.
 
-|                           | Cloud SQL for PostgreSQL                                                                                                                                                            | Postgres in Kubernetes (e.g. CloudNativePG)                                                                                                          |
-|---------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Endpoint                  | The instance's PSA DNS name (from `dnsNames`, `…sql-psa.goog`), port 5432. Cloud SQL creates no record for PSA, so a Cloud DNS private-zone record maps that name to the private IP | The primary's read-write Service, `<cluster>-rw.<ns>.svc`, port 5432                                                                                 |
-| Not usable for the writer | Managed Connection Pooling and the Auth Proxy. Transaction mode forbids session locks, and through a proxy the keepalives cannot see a dead client                                  | A PgBouncer `Pooler`, for the same reason; the `-ro`/`-r` Services (the recovery self-check refuses them)                                            |
-| TLS                       | `sslmode=verify-full`. The server CA mode is `GOOGLE_MANAGED_CAS_CA` (or `CUSTOMER_MANAGED_CAS_CA`), which puts the DNS name in the certificate; `sslrootcert` is the CA bundle     | `sslmode=verify-full`, with the operator's CA from its Secret. The Service name is in the certificate                                                |
-| Auth                      | Password users from Secret Manager. IAM can come later through `Pool::set_connect_options`                                                                                          | The operator-generated Secret (client certificates optional)                                                                                         |
-| Failover                  | HA uses synchronous disk replication: about 60 s, no data loss                                                                                                                      | The operator promotes a replica. Asynchronous replication can lose the last commits, which `writer_seq` catches. Synchronous replicas avoid the loss |
-| `max_connections`         | Set by machine size (e.g. 500 at 15 GB)                                                                                                                                             | The operator's setting (often 100)                                                                                                                   |
+**Credentials: `PGUSER` and `PGPASSWORD`.**
+
+- **Read explicitly.** `DbConfig::from_env` reads `PGUSER` and `PGPASSWORD`
+  through an injectable lookup, so unit tests pass a fake environment
+  instead of mutating the process's. It applies each one to the connect
+  options only where the URL has no user or no password. sqlx's
+  `PgConnectOptions::from_str` reads the same variables as its defaults
+  (`sqlx-postgres-0.9.0/src/options/parse.rs:9-10`, `mod.rs:56-98`), so the
+  two agree.
+- **Precedence.** A user or password written into the URL wins. The
+  manifests never put one there. Local and CI runs may, so
+  `postgres://explorer:explorer@localhost:5432/explorer` (`AGENTS.md`)
+  keeps working. When the URL carries a password and `PGPASSWORD` is also
+  set, startup logs a warning that the URL's password was used.
+- **Never logged.** The password lives only in a redacting newtype inside
+  `DbConfig` and in sqlx's connect options. It never enters `Settings`, so
+  the startup log and `Debug` output cannot show it.
+- **Missing or wrong.** Without `PGUSER`, sqlx falls back to the process's
+  OS user, so authentication fails rather than connecting as someone else.
+  A missing or wrong password fails authentication too: the indexer stays
+  unready and retries, and web pages return 503 (section 8).
+- **Rotation.** A container's environment is fixed when it starts. Open
+  sessions survive a password change, but new connections (pool growth, a
+  writer reacquire) use the password the pod started with. So change the
+  password in the database and in Secret Manager, wait for the synced
+  Secret, then `kubectl rollout restart` both deployments, indexer first.
+- **Tests.** Unit tests cover the precedence with a fake environment: a
+  credential-free URL plus both variables, a URL password plus
+  `PGPASSWORD`, and neither. One integration test connects to the CI server
+  with a credential-free `PG_TEST_URL` and the variables set.
+
+**Telling a Postgres URL from a SQLite path.** One function,
+`DbTarget::parse`, classifies the argument of `open` and the value of
+`DATABASE_URL`. `DB_PATH` is always a file path and is never classified.
+
+- **`postgres://…` or `postgresql://…`** is Postgres, as given.
+- **No scheme, in the form `[user[:password]@]host:port[/dbname][?params]`,**
+  is Postgres too, and is normalized by prefixing `postgres://`. The host is
+  a DNS name, an IPv4 address or a bracketed IPv6 address, and the port is
+  1 to 5 digits. Examples: `localhost:5432`, `127.0.0.1:5432/explorer`,
+  `[::1]:5432` and `explorer:explorer@localhost:5432/explorer`.
+- **Anything else is a SQLite path:** `explorer.db`, `/data/explorer.db`,
+  `:memory:`, `C:\data\explorer.db`, `localhost` (no port) and
+  `file:x.db`.
+- **Missing parts come from the environment.** The user is `PGUSER` and
+  the password is `PGPASSWORD` (see "Credentials" above). The database is
+  `PGDATABASE` or the server's default
+  (`sqlx-postgres-0.9.0/src/options/mod.rs:56-98`). So `localhost:5432`
+  against docker-compose needs `PGUSER`, `PGPASSWORD` and `PGDATABASE`, or
+  the credentials written into the string.
+- **No silent fallback.** A string classified as Postgres that fails to
+  parse is an error, never a SQLite file. A `DATABASE_URL` that classifies
+  as a SQLite path is refused with "use `DB_PATH` for SQLite".
+- **The TLS policy still applies.** Loopback needs no `sslmode`;
+  `db.internal:5432` without `?sslmode=verify-full` is refused.
+- **Tests and stage.** A unit test runs every example above in both
+  directions, and `DbUrl` redacts the password in either form. The
+  classifier lands in stage 3, with `open`'s Postgres arm.
+
+|                           | Cloud SQL for PostgreSQL                                                                                                                                                                                                             | Postgres in Kubernetes (e.g. CloudNativePG)                                                                                                          |
+|---------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Endpoint                  | The instance's PSA DNS name (from `dnsNames`, `…sql-psa.goog`), port 5432. Cloud SQL creates no record for PSA, so a Cloud DNS private-zone record maps that name to the private IP                                                  | The primary's read-write Service, `<cluster>-rw.<ns>.svc`, port 5432                                                                                 |
+| Not usable for the writer | Managed Connection Pooling and the Auth Proxy. Transaction mode forbids session locks, and through a proxy the keepalives cannot see a dead client                                                                                   | A PgBouncer `Pooler`, for the same reason; the `-ro`/`-r` Services (the recovery self-check refuses them)                                            |
+| TLS                       | `sslmode=verify-full`. The server CA mode is `GOOGLE_MANAGED_CAS_CA` (or `CUSTOMER_MANAGED_CAS_CA`), which puts the DNS name in the certificate; `sslrootcert` is the CA bundle                                                      | `sslmode=verify-full`, with the operator's CA from its Secret. The Service name is in the certificate                                                |
+| Auth                      | Password users. `PGPASSWORD` comes from Secret Manager through a Kubernetes Secret synced from it (for example by External Secrets Operator), referenced with `secretKeyRef`. IAM can come later through `Pool::set_connect_options` | The operator-generated Secret: `PGUSER` and `PGPASSWORD` from its `username` and `password` keys (client certificates optional)                      |
+| Failover                  | HA uses synchronous disk replication: about 60 s, no data loss                                                                                                                                                                       | The operator promotes a replica. Asynchronous replication can lose the last commits, which `writer_seq` catches. Synchronous replicas avoid the loss |
+| `max_connections`         | Set by machine size (e.g. 500 at 15 GB)                                                                                                                                                                                              | The operator's setting (often 100)                                                                                                                   |
 
 **TLS policy.**
 
@@ -1076,9 +1164,10 @@ alone still opens the file.
   `save_selector_names` and `set_trace` succeed, and that an insert into
   `blocks` fails with `42501`.
 
-**Credentials in logs.** A `DbUrl` newtype redacts the password in
-`Display` and `Debug`. That covers `main.rs`'s startup log
+**Credentials in logs.** A `DbUrl` newtype redacts any password written
+into a URL, in `Display` and `Debug`. That covers `main.rs`'s startup log
 (`main.rs:24-27`), the `Debug` output of `Settings`, and error contexts.
+`PGPASSWORD` never enters `Settings` at all (see "Credentials" above).
 
 ## 8. Roles and the split deployment
 
@@ -1089,8 +1178,8 @@ alone still opens the file.
 | `web`           | Pages, SSE, the follower and cache writes. It never takes the lock                                                                                                                             | No                         |
 
 One image runs as either deployment. Only the environment differs: `ROLE`,
-`DATABASE_URL` from that deployment's Secret, and therefore the database
-user.
+`DATABASE_URL` and `PGUSER` as plain values, and `PGPASSWORD` from that
+deployment's Secret. Each deployment has its own database user.
 
 ```mermaid
 flowchart LR
@@ -1153,7 +1242,7 @@ flowchart LR
 |             | `explorer-indexer`                                                                                                                                                                                                     | `explorer-web`                                                                                                                                                                                                                                                                   |
 |-------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Kind        | Deployment, `replicas: 1`, RollingUpdate with `maxSurge: 1` and `maxUnavailable: 0`. The new pod becomes Ready after its preflight and waits as a candidate. Only then is the old pod terminated, which frees the lock | Deployment, Service and HorizontalPodAutoscaler; RollingUpdate with `maxUnavailable: 0`                                                                                                                                                                                          |
-| Env         | `ROLE=indexer`; `DATABASE_URL` from the indexer Secret                                                                                                                                                                 | `ROLE=web`; `DATABASE_URL` from the web Secret                                                                                                                                                                                                                                   |
+| Env         | `ROLE=indexer`; `DATABASE_URL` with no credentials and `PGUSER=explorer_indexer` as plain env; `PGPASSWORD` from the indexer Secret (`secretKeyRef`)                                                                   | `ROLE=web`; `DATABASE_URL` with no credentials and `PGUSER=explorer_web` as plain env; `PGPASSWORD` from the web Secret (`secretKeyRef`)                                                                                                                                         |
 | Probes      | Startup and liveness: `/healthz`, with a generous startup budget. Readiness: `/readyz` (preflight passed). **Never gate on the lock**, or every deploy that carries a migration deadlocks                              | Startup and liveness: `/healthz`, with no DB check, so a failover doesn't restart every replica. Readiness: `/readyz` (schema gate), `periodSeconds: 5`, `failureThreshold: 3`                                                                                                   |
 | Termination | `terminationGracePeriodSeconds: 30`                                                                                                                                                                                    | `lifecycle.preStop.sleep.seconds: 10`, so endpoints are removed before the drain starts; `terminationGracePeriodSeconds: 30`                                                                                                                                                     |
 | Connections | About 6 (12 during a rollout)                                                                                                                                                                                          | About 10 per pod (read 8, cache 2). Cap the HPA maximum so that `pods × 10 + 12` stays within `max_connections`                                                                                                                                                                  |
@@ -1161,7 +1250,8 @@ flowchart LR
 
 **Also shipped:**
 
-- `secrets.example.yaml`;
+- `secrets.example.yaml`, holding only each deployment's `PGPASSWORD`.
+  The URL and the user are not secret;
 - the CA mount;
 - `deploy/k8s/README.md`, with the deploy order (indexer first) and a
   Cloud Run note. On Cloud Run, the same image runs with min = max = 1
@@ -1426,6 +1516,7 @@ Each stage is a PR that merges with CI green.
 | 5                 | `ROLE=web` and `ROLE=indexer`. The follower. The 503 middleware and `exec_best_effort`. The web schema gate. In `indexer.rs`: the writer-loop `keepalive` and exit codes 3, 4 and 5. Bind-before-open and lock-free `/readyz`. `src/metrics.rs` and `/metrics`                                                                                                                                                                                                                                                                                                                             | `ROLE=all`: binds before open, and exits with code 5 when the writer, forward or backfill task ends (today it keeps serving). Otherwise unchanged |
 | 6                 | `DbUrl`. `deploy/k8s/`. The runbook, with the cutover checklist. `docs/database.md`. The live Postgres baseline in CI, and the nightly PG 15 job. The indexer's `sync` status in `/readyz`                                                                                                                                                                                                                                                                                                                                                                                                 | —                                                                                                                                                 |
 | 7 (on a p95 miss) | `tokio::join!` of independent Postgres page queries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | SQLite unchanged                                                                                                                                  |
+| 8 (last)          | `README.md`, after stages 0–7 have merged, so it describes the code that shipped (checklist below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Docs only                                                                                                                                         |
 
 **Coordinating with teammates**
 
@@ -1436,6 +1527,52 @@ Each stage is a PR that merges with CI green.
 - **Stage 2.** Announce that `init_db` is frozen. Pins A and B point to
   `docs/database.md`. In-flight PRs that edit `init_db` are rewritten as
   migration pairs.
+
+**Stage 8: `README.md`**
+
+The last task, once every code stage has merged, so the README describes
+what shipped rather than what was planned. It rewrites the sections that
+phase 3 makes stale:
+
+- **Intro** (`README.md:12-15`): "rusqlite (schema created on boot)"
+  becomes SQLite or Postgres (sqlx 0.9), with versioned migrations.
+- **Deploying to the cloud** (`README.md:31-75`): the single-process
+  options (Fly, Railway, Render, a VPS) stay, as `ROLE=all` on SQLite. Add
+  the split Kubernetes deployment on Postgres (Cloud SQL or CloudNativePG),
+  pointing at `deploy/k8s/README.md` and the deploy order (indexer first).
+- **Persistence & schema migrations** (`README.md:77-92`): replace the
+  idempotent-DDL text with versioned migrations. On SQLite, migration 1 is
+  the frozen `init_db`, existing files are adopted and stamped v1, a
+  database newer than the binary (D > B) is refused, and the only way back
+  is forward. Link `docs/database.md`.
+- **Indexer** (`README.md:110-127` and `207-225`): one writer task writes
+  to either backend, and under `ROLE=indexer` it holds the session advisory
+  lock. Replace "Serialized SQLite writes ... ~200 blocks/s" with both
+  backends' write paths and the Postgres re-index rate measured in section
+  12, item 7.
+- **Configuration** (`README.md:129-145`): add `DATABASE_URL`, `PGUSER`,
+  `PGPASSWORD`, `ROLE`,
+  `DB_WEB_ROLE`, `DB_TLS_INSECURE` and `FOLLOW_POLL_MS`, plus the existing
+  `DB_CACHE_KIB` (`db.rs:164`), which the table lacks today. `DB_PATH` stays
+  the SQLite setting, and `DATABASE_URL` wins when it is set. Note that
+  `DATABASE_URL` accepts `host:port` without a scheme (section 7).
+- **Routes** (`README.md:147-171`): add `/healthz`, `/readyz` and
+  `/metrics` (the last under `ROLE=web` and `ROLE=indexer` only). The
+  live-feed paragraph says the in-process feed is `ROLE=all`'s, and that
+  web replicas get theirs from the polling follower.
+- **Known limitations** (a new section): under the split deployment, a
+  token with no mint, transfer or fee use yet is not listed or searchable,
+  even after its page is opened, until its first transfer. Leave it out
+  only if the factory-discovery fix has shipped by then.
+- **Tests** (`README.md:227-245`): add the `TEST_DB=postgres` runs with
+  `docker compose` and `PG_TEST_URL`, as `AGENTS.md` has them.
+- **Layout** (`README.md:247-271`): `src/db/` (`mod.rs`, `sqlite.rs`,
+  `pg/`, `migrations.rs`), `migrations/`, `src/follow.rs`,
+  `src/metrics.rs` and `deploy/k8s/`.
+
+Before it merges, the reviewer checks that every variable in the
+configuration table is read by the code and every route in the routes table
+exists.
 
 **Cutover: side by side** (decision 9)
 
@@ -1629,7 +1766,7 @@ can run at any time.
   migration 1.
 - **`docs/database.md`** ("There is no migration runner and no version
   number") and **`AGENTS.md`** (the test commands) are rewritten in stages 2
-  and 6.
+  and 6. **`README.md`** is rewritten last, in stage 8.
 
 ## 14. Out of scope
 
@@ -1642,7 +1779,7 @@ can run at any time.
 - LISTEN/NOTIFY (deferred; section 8).
 - IAM database authentication (planned for later).
 - Discovering factory-created tokens with no transfers (a follow-up;
-  section 6).
+  section 6). Pending the owner's decision: see "Known limitations".
 - Cloud Run manifests (a note in `deploy/k8s/README.md` only), and Fly.io
   or Render deployments of the Postgres mode.
 - Provisioning Postgres: Terraform, or the operator's `Cluster` resource.
@@ -1683,3 +1820,6 @@ The phase is done when:
    pod each produce zero non-2xx responses.
 9. **Data growth.** On the fully re-indexed production data, every URL in
    the page list meets the section 10 p95 bound.
+10. **`README.md` matches the shipped code** (stage 8). Its configuration
+    table lists every variable the code reads, its routes table every
+    route, and it states the known limitations.
