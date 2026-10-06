@@ -1,7 +1,6 @@
 //! The Postgres backend: hand-written twins of every `sqlite.rs` function,
-//! read pools for pages, and a pool for the caches pages write. The writer,
-//! one owned session under a session-level advisory lock, comes next; until
-//! then every chain write here is an error.
+//! read pools for pages, and one owned writer session that holds a
+//! session-level advisory lock.
 //!
 //! Each connection carries its own settings in its startup options, because
 //! role defaults apply to every connection a role opens and Cloud SQL has no
@@ -12,23 +11,29 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::watch;
 
 use super::config::PasswordSource;
 use super::{migrations, DbConfig, Role, Status};
 
 mod blocks;
+mod error;
+pub(crate) mod migrate;
 pub(crate) mod q;
 pub(crate) mod shared;
 mod tokens;
 mod transfers;
 mod txs;
+mod write;
+pub(crate) mod writer;
 
 pub(crate) use blocks::*;
+pub use error::DbError;
 pub(crate) use tokens::*;
 pub(crate) use transfers::*;
 pub(crate) use txs::*;
+pub(crate) use write::*;
 
 tokio::task_local! {
     /// Set by a read that failed, so the response becomes a 503 rather than
@@ -65,6 +70,14 @@ pub(crate) struct PgDb {
     pub(crate) read: PgPool,
     /// True caches web pages write (selector names, traces).
     pub(crate) cache: PgPool,
+    /// The one writer, under `ROLE=indexer` and `all`.
+    pub(crate) writer: Option<writer::Writer>,
+}
+
+impl PgDb {
+    pub(crate) fn writer(&self) -> Result<&writer::Writer, DbError> {
+        self.writer.as_ref().ok_or(DbError::NotWriter)
+    }
 }
 
 /// `explorer-<role>/<build>/b<B>`, so `pg_stat_activity` says who is who.
@@ -121,12 +134,24 @@ pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Resu
         cfg.tuning.pool_max.unwrap_or(2).min(2),
         0,
     );
-    // No writer yet, so nothing here migrates: D is read, not made.
-    tokio::spawn(first_gate(read.clone(), status.clone()));
-    Ok(PgDb { read, cache })
+    let writer = match cfg.role {
+        Role::Web => {
+            tokio::spawn(first_gate(read.clone(), status.clone()));
+            None
+        }
+        Role::Indexer | Role::All => {
+            let opts = base.application_name(&application_name(cfg.role, "writer"));
+            Some(writer::Writer::start(opts, read.clone(), cfg, status.clone()).await?)
+        }
+    };
+    Ok(PgDb {
+        read,
+        cache,
+        writer,
+    })
 }
 
-/// D: read until it answers once.
+/// D for a web replica: read until it answers once.
 async fn first_gate(read: PgPool, status: watch::Sender<Status>) {
     loop {
         match schema_version(&read).await {
@@ -170,24 +195,8 @@ pub(crate) async fn schema_version(read: &PgPool) -> Result<i64> {
     Ok(row.unwrap_or(0))
 }
 
-// Not on Postgres yet: the writes land with the writer, before Postgres
-// becomes selectable.
-
-pub(crate) async fn save_block(_: &PgDb, _: &crate::models::Block) -> Result<()> {
-    anyhow::bail!("save_block: not implemented on Postgres yet")
-}
-
-pub(crate) async fn save_transaction(_: &PgDb, _: &crate::models::Transaction) -> Result<()> {
-    anyhow::bail!("save_transaction: not implemented on Postgres yet")
-}
-
-pub(crate) async fn save_token_metadata(_: &PgDb, _: &crate::tokens::TokenMeta) -> Result<()> {
-    anyhow::bail!("save_token_metadata: not implemented on Postgres yet")
-}
-
-pub(crate) async fn set_chain_head(_: &PgDb, _: i64) {
-    tracing::warn!("set_chain_head: not implemented on Postgres yet");
-}
+// Not on Postgres yet: the batch writer and the indexer's jobs land before
+// Postgres becomes selectable.
 
 pub(crate) async fn save_block_bundles(_: &PgDb, _: &[crate::models::BlockBundle]) -> Result<()> {
     anyhow::bail!("save_block_bundles: not implemented on Postgres yet")
@@ -221,6 +230,16 @@ pub(crate) async fn repair_derived_tables(_: &PgDb) {}
 
 pub(crate) async fn compute_and_store_stats(_: &PgDb) -> Result<serde_json::Value> {
     anyhow::bail!("compute_and_store_stats: not implemented on Postgres yet")
+}
+
+/// One raw connection with `opts`, within 10 s.
+pub(crate) async fn connect(opts: &PgConnectOptions) -> Result<PgConnection> {
+    let conn = tokio::time::timeout(Duration::from_secs(10), PgConnection::connect_with(opts))
+        .await
+        .context("connect: no answer within 10 s")?
+        .context("connect")?;
+    check_version(&conn)?;
+    Ok(conn)
 }
 
 #[cfg(test)]

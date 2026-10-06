@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use sqlx::postgres::{PgArguments, PgRow};
-use sqlx::{PgPool, Postgres};
+use sqlx::{PgConnection, PgPool, Postgres};
 
-use super::flag_failure;
+use super::{flag_failure, DbError};
 
 pub(crate) type PgQuery = sqlx::query::Query<'static, Postgres, PgArguments>;
 
@@ -212,4 +212,51 @@ pub(crate) async fn exec_best_effort(
             Err(anyhow::anyhow!("{what}: {e}"))
         }
     }
+}
+
+// Writer-side helpers: one statement on the writer's transaction, counted, with
+// the error classified for the retry loop.
+
+pub(crate) async fn exec(c: &mut PgConnection, what: &str, q: PgQuery) -> Result<u64, DbError> {
+    count_statement();
+    q.execute(c)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| DbError::from_sqlx(what, e))
+}
+
+pub(crate) async fn fetch_optional(
+    c: &mut PgConnection,
+    what: &str,
+    q: PgQuery,
+) -> Result<Option<PgRow>, DbError> {
+    count_statement();
+    q.fetch_optional(c)
+        .await
+        .map_err(|e| DbError::from_sqlx(what, e))
+}
+
+pub(crate) async fn fetch_one(
+    c: &mut PgConnection,
+    what: &str,
+    q: PgQuery,
+) -> Result<PgRow, DbError> {
+    count_statement();
+    q.fetch_one(c)
+        .await
+        .map_err(|e| DbError::from_sqlx(what, e))
+}
+
+/// A statement with no parameters, sent as a simple query.
+pub(crate) async fn raw(
+    c: &mut PgConnection,
+    what: &str,
+    sql: &'static str,
+) -> Result<(), DbError> {
+    count_statement();
+    sqlx::raw_sql(sql)
+        .execute(c)
+        .await
+        .map(|_| ())
+        .map_err(|e| DbError::from_sqlx(what, e))
 }

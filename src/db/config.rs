@@ -161,10 +161,36 @@ pub enum PasswordSource {
 }
 
 /// Timings and sizes with production defaults, which tests shorten.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Tuning {
     /// The read pool's size; by role when `None`.
     pub pool_max: Option<u32>,
+    /// The writer's lease: its session's `idle_session_timeout`.
+    pub lease: std::time::Duration,
+    /// How often a candidate asks for the lock.
+    pub candidate_retry: std::time::Duration,
+    /// How long a re-acquiring writer keeps losing `try_lock` before it gives
+    /// up and exits with code 3.
+    pub lost_after: std::time::Duration,
+    /// How often the `Long` watchdog checks the lock.
+    pub watchdog: std::time::Duration,
+    /// Report the writer's fatal exits (3, 4) as errors instead of exiting,
+    /// for tests that run several writers in one process.
+    pub catch_exits: bool,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        use std::time::Duration;
+        Tuning {
+            pool_max: None,
+            lease: Duration::from_secs(30),
+            candidate_retry: Duration::from_secs(5),
+            lost_after: Duration::from_secs(120),
+            watchdog: Duration::from_secs(15),
+            catch_exits: false,
+        }
+    }
 }
 
 /// Everything `db::open_with` needs from the environment.
@@ -178,6 +204,9 @@ pub struct DbConfig {
     pub password: Option<Secret>,
     /// `PGSSLMODE`, which the URL's own `sslmode` overrides.
     pub ssl_mode: Option<String>,
+    /// `DB_WEB_ROLE`: the database user web replicas connect as, granted read
+    /// access by the indexer.
+    pub web_role: String,
     pub tuning: Tuning,
 }
 
@@ -205,12 +234,17 @@ impl DbConfig {
                  process, which runs as ROLE=all"
             );
         }
+        let web_role = set("DB_WEB_ROLE").unwrap_or_else(|| "explorer_web".into());
+        if !is_identifier(&web_role) {
+            bail!("DB_WEB_ROLE={web_role:?}: use a plain identifier (letters, digits, _)");
+        }
         Ok(DbConfig {
             role,
             target,
             user: set("PGUSER"),
             password: lookup("PGPASSWORD").filter(|p| !p.is_empty()).map(Secret),
             ssl_mode: set("PGSSLMODE"),
+            web_role,
             tuning: Tuning::default(),
         })
     }
@@ -223,6 +257,7 @@ impl DbConfig {
             user: None,
             password: None,
             ssl_mode: None,
+            web_role: "explorer_web".into(),
             tuning: Tuning::default(),
         }
     }
@@ -237,6 +272,7 @@ impl DbConfig {
             user: env("PGUSER"),
             password: env("PGPASSWORD").map(Secret),
             ssl_mode: env("PGSSLMODE"),
+            web_role: env("DB_WEB_ROLE").unwrap_or_else(|| "explorer_web".into()),
             tuning: Tuning::default(),
         }
     }
@@ -286,6 +322,14 @@ impl DbConfig {
         }
         Ok(opts.ssl_mode(PgSslMode::Disable))
     }
+}
+
+/// A name safe to put into a statement as an identifier.
+pub(crate) fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !s.starts_with(|c: char| c.is_ascii_digit())
 }
 
 #[cfg(test)]

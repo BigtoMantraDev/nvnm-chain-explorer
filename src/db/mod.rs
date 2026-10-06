@@ -29,7 +29,8 @@ mod sqlite;
 mod status;
 
 pub use config::{DbConfig, DbTarget, DbUrl, PasswordSource, Role, Tuning};
-pub use status::{SchemaVersions, Status};
+pub use pg::DbError;
+pub use status::{Preflight, SchemaVersions, Status, WriterState};
 
 #[doc(hidden)]
 pub use sqlite::{
@@ -66,8 +67,13 @@ pub async fn open(path_or_url: &str) -> Result<Db> {
 }
 
 /// Open the configured database for `cfg.role`, publishing progress on
-/// `status`, which `/readyz` reads. On Postgres the pools are lazy and this
-/// never waits on the database.
+/// `status`, which `/readyz` reads.
+///
+/// Under `ROLE=indexer` or `all` on Postgres this returns once the process is
+/// the writer: it connects (retrying while the database is unreachable), passes
+/// the preflight, waits as a candidate for the lock, and migrates. A preflight
+/// refusal is an error. Under `ROLE=web` the pools are lazy and this never
+/// waits on the database.
 pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<Db> {
     let backend = match &cfg.target {
         DbTarget::Sqlite(path) => {
@@ -94,6 +100,16 @@ pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<
         // Every later label change goes through this process's own writes, so
         // the seed is retried only until it lands.
         tokio::spawn(reseed_until_ok(Arc::downgrade(&db.0), true));
+    }
+    if let Backend::Postgres(p) = &db.0.backend {
+        if let Some(writer) = &p.writer {
+            // The previous leader kept writing while this process waited, so
+            // every new leadership re-seeds.
+            let weak = Arc::downgrade(&db.0);
+            writer.set_on_leader(Box::new(move || {
+                tokio::spawn(reseed_until_ok(weak.clone(), false));
+            }));
+        }
     }
     Ok(db)
 }
@@ -201,6 +217,14 @@ pub fn update_status(db: &Db, f: impl FnOnce(&mut Status)) {
 /// The role this database was opened for.
 pub fn role(db: &Db) -> Role {
     db.0.role
+}
+
+/// Unix time of the writer's last commit or keepalive, where there is one.
+pub fn writer_last_ok(db: &Db) -> Option<i64> {
+    match &db.0.backend {
+        Backend::Postgres(p) => p.writer.as_ref().map(|w| w.last_ok()),
+        Backend::Sqlite(_) => None,
+    }
 }
 
 /// Run `f`, and say whether any database read in it failed. The 503
@@ -395,12 +419,52 @@ pub async fn save_anchoring_window(
     }
 }
 
+/// The writer's heartbeat: on Postgres, `SELECT 1` on the lock-holding
+/// session within 5 s, which keeps its lease (`idle_session_timeout`) from
+/// expiring. Nothing on SQLite.
+pub async fn keepalive(db: &Db) {
+    if let Backend::Postgres(p) = &db.0.backend {
+        pg::keepalive(p).await;
+    }
+}
+
 /// D: the database's schema version, read from the database. On SQLite, an
 /// open file is always at this binary's version.
 pub async fn schema_version(db: &Db) -> Result<i64> {
     match &db.0.backend {
         Backend::Sqlite(_) => Ok(migrations::binary_version()),
         Backend::Postgres(p) => pg::schema_version(&p.read).await,
+    }
+}
+
+/// Hooks for tests that need a backend's internals, on either backend.
+#[doc(hidden)]
+pub mod testing {
+    use super::*;
+
+    /// Run `sql` on the writer on the `Long` budget, as migrations and repairs
+    /// run: no statement timeout, under the watchdog.
+    pub async fn long_statement(db: &Db, sql: &'static str) -> Result<()> {
+        let Backend::Postgres(p) = &db.0.backend else {
+            bail!("Postgres only");
+        };
+        p.writer()?
+            .write(
+                pg::writer::Budget::Long,
+                move |c| -> pg::writer::TxFuture<'_, ()> {
+                    Box::pin(async move { pg::q::raw(c, "long", sql).await })
+                },
+            )
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    /// The backend pid of the writer session, on Postgres.
+    pub fn writer_pid(db: &Db) -> Option<i32> {
+        match &db.0.backend {
+            Backend::Postgres(p) => p.writer.as_ref().map(|w| w.pid()),
+            Backend::Sqlite(_) => None,
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 //! Versioned migrations, end to end.
 //!
-//! The SQLite tests need nothing but the fixtures.
+//! The SQLite tests need nothing but the fixtures. The Postgres ones are
+//! ignored unless run with `--include-ignored`, and then fail unless
+//! `PG_TEST_URL` names a server.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -141,4 +143,224 @@ async fn both_canaries_are_adopted_with_their_rows_intact() {
             changed.join("\n")
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Postgres: what the preflight refuses, before it ever asks for the lock
+// ---------------------------------------------------------------------------
+
+#[path = "common/backend.rs"]
+mod backend;
+
+use std::time::Duration;
+
+use nvnmchain_explorer::db::{DbConfig, Role, Status};
+use sqlx::{AssertSqlSafe, Connection as _, PgConnection};
+
+async fn pg_exec(url: &str, sql: &str) {
+    let mut conn = PgConnection::connect(url).await.unwrap();
+    sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
+        .execute(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+fn indexer(url: &str) -> DbConfig {
+    let mut cfg = backend::pg_config(url, Role::Indexer);
+    cfg.tuning.candidate_retry = Duration::from_millis(100);
+    cfg
+}
+
+/// The open error, which must come within a few seconds: a refusal never
+/// waits for the lock.
+async fn refusal(cfg: &DbConfig) -> String {
+    let open = db::open_with(
+        cfg,
+        tokio::sync::watch::channel(Status::starting(cfg.role)).0,
+    );
+    match tokio::time::timeout(Duration::from_secs(15), open).await {
+        Ok(Ok(_)) => panic!("opened"),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => panic!("no refusal within 15 s"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn an_edited_postgres_migration_is_refused() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    drop(
+        db::open_with(
+            &indexer(&url),
+            tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
+        )
+        .await
+        .unwrap(),
+    );
+    pg_exec(
+        &url,
+        "UPDATE schema_migrations SET checksum = 'x' WHERE version = 1",
+    )
+    .await;
+    let err = refusal(&indexer(&url)).await;
+    assert!(
+        err.contains("migration 1 was edited after it was applied"),
+        "{err}"
+    );
+}
+
+/// D > B is refused at preflight, while another writer holds the lock.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_newer_postgres_database_is_refused_before_the_lock() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    let leader = db::open_with(
+        &indexer(&url),
+        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
+    )
+    .await
+    .unwrap();
+    let newer = db::migrations::binary_version() + 1;
+    pg_exec(
+        &url,
+        &format!("INSERT INTO schema_migrations VALUES ({newer}, 'later', 'x', 0, 'test')"),
+    )
+    .await;
+    let err = refusal(&indexer(&url)).await;
+    assert!(err.contains("newer than this binary"), "{err}");
+    drop(leader);
+}
+
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_schema_applied_by_hand_is_refused() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    pg_exec(
+        &url,
+        include_str!("../migrations/postgres/0001_baseline.sql"),
+    )
+    .await;
+    let err = refusal(&indexer(&url)).await;
+    assert!(err.contains("no schema_migrations"), "{err}");
+}
+
+/// An index a failed concurrent build left INVALID is refused, unless
+/// `REINDEX CONCURRENTLY` is building it.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn an_invalid_index_is_refused() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    drop(
+        db::open_with(
+            &indexer(&url),
+            tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
+        )
+        .await
+        .unwrap(),
+    );
+    pg_exec(
+        &url,
+        "INSERT INTO kv (key, value) VALUES ('a', 'same'), ('b', 'same');
+         UPDATE pg_index SET indisvalid = false
+         WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_blocks_timestamp'
+                             AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()))",
+    )
+    .await;
+    let err = refusal(&indexer(&url)).await;
+    assert!(
+        err.contains("INVALID") && err.contains("idx_blocks_timestamp"),
+        "{err}"
+    );
+
+    pg_exec(
+        &url,
+        "ALTER INDEX idx_blocks_timestamp RENAME TO idx_blocks_timestamp_ccnew",
+    )
+    .await;
+    db::open_with(
+        &indexer(&url),
+        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
+    )
+    .await
+    .expect("a REINDEX CONCURRENTLY in progress does not block a start");
+}
+
+/// Web replicas read everything and write only the two caches.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn the_web_role_reads_and_writes_only_the_caches() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    let role = format!("t_web_{}", std::process::id());
+    pg_exec(
+        &url,
+        &format!("DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'pw'"),
+    )
+    .await;
+    let mut cfg = indexer(&url);
+    cfg.web_role = role.clone();
+    let writer = db::open_with(
+        &cfg,
+        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
+    )
+    .await
+    .unwrap();
+    let block = nvnmchain_explorer::models::Block {
+        number: 1,
+        hash: format!("0x{:064x}", 1),
+        parent_hash: format!("0x{:064x}", 0),
+        timestamp: 1,
+        timestamp_ms: 0,
+        gas_used: 0,
+        gas_limit: 0,
+        base_fee: "0".into(),
+        size: 0,
+        extra_data: String::new(),
+        epoch: 0,
+        view: 0,
+        proposer: format!("0x{}", "33".repeat(20)),
+        miner: format!("0x{}", "33".repeat(20)),
+        tx_count: 0,
+        created_at: 0,
+    };
+    db::save_block(&writer, &block).await.unwrap();
+
+    let mut as_web = url::Url::parse(&url).unwrap();
+    as_web.set_username(&role).unwrap();
+    as_web.set_password(Some("pw")).unwrap();
+    let web = db::open_with(
+        &backend::pg_config(as_web.as_str(), Role::Web),
+        tokio::sync::watch::channel(Status::starting(Role::Web)).0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(db::get_latest_block(&web).await.map(|b| b.number), Some(1));
+    db::save_selector_names(&web, &[("0x12345678".into(), "f()".into())])
+        .await
+        .expect("selector cache");
+    db::set_trace(&web, &format!("0x{:064x}", 9), "{}")
+        .await
+        .expect("trace cache");
+    let err = db::save_block(&web, &block).await.unwrap_err();
+    assert!(format!("{err:#}").contains("no writer"), "{err:#}");
+
+    let mut conn = PgConnection::connect(as_web.as_str()).await.unwrap();
+    let denied = sqlx::query(
+        "INSERT INTO blocks (number, hash, parent_hash, timestamp) VALUES (2, '\\x02', '\\x01', 0)",
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        denied.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("42501")
+    );
+    // A cache write that fails is logged and never makes the page a 503.
+    pg_exec(&url, &format!("REVOKE UPDATE ON transactions FROM {role}")).await;
+    let (written, failed) =
+        db::track_failures(db::set_trace(&web, &format!("0x{:064x}", 9), "{}")).await;
+    assert!(written.is_err(), "the write was refused");
+    assert!(!failed, "a cache write never sets the 503 flag");
+
+    drop((web, writer));
+    pg_exec(&url, &format!("DROP OWNED BY {role}; DROP ROLE {role}")).await;
 }
