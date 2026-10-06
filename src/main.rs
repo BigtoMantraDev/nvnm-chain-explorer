@@ -27,7 +27,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.rpc_url, cfg.db_path
     );
 
-    let db: Db = db::open(&cfg.db_path).context("initialize database")?;
+    let db: Db = db::open(&cfg.db_path)
+        .await
+        .context("initialize database")?;
     let rpc = ChainRpc::from_settings(&cfg)?;
     let tera = web::build_tera(db.clone())?;
 
@@ -50,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // before the first recompute.
     let home_stats = Arc::new(std::sync::RwLock::new(
         db::get_kv(&db, "stats")
+            .await
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(serde_json::Value::Null),
     ));

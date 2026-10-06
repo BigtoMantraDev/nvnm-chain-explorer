@@ -69,8 +69,8 @@ fn rpc() -> ChainRpc {
 }
 
 /// The one line that differs between builds: how a database is opened.
-fn open_db(path: &str) -> Db {
-    db::open(path).expect("open database")
+async fn open_db(path: &str) -> Db {
+    db::open(path).await.expect("open database")
 }
 
 fn open_baseline(path: &str) -> Connection {
@@ -144,7 +144,7 @@ async fn reindex(rpc: &ChainRpc, db: &Db, runs: &[RangeInclusive<u64>]) {
         .try_chunks(COMMIT);
     while let Some(chunk) = bundles.next().await {
         let chunk = chunk.map_err(|e| e.1).expect("fetch");
-        db::save_block_bundles(db, &chunk).expect("save");
+        db::save_block_bundles(db, &chunk).await.expect("save");
     }
     add_genesis_balances(rpc, db).await;
 }
@@ -153,8 +153,9 @@ async fn reindex(rpc: &ChainRpc, db: &Db, runs: &[RangeInclusive<u64>]) {
 /// transfers' holders and store each one's balance at block 0. A page's
 /// lookup is retried; the cursor only moves once its balances are stored.
 async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) {
-    while let Some((cursor, holders)) =
-        db::holders_without_genesis_balance(db, 1000).expect("genesis holders")
+    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000)
+        .await
+        .expect("genesis holders")
     {
         let mut wait = Duration::from_millis(250);
         let balances = loop {
@@ -166,7 +167,9 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) {
             wait *= 2;
         };
         let rows: Vec<_> = holders.into_iter().zip(balances).collect();
-        db::save_genesis_balances(db, &rows, cursor).expect("save genesis balances");
+        db::save_genesis_balances(db, &rows, cursor)
+            .await
+            .expect("save genesis balances");
     }
 }
 
@@ -258,7 +261,7 @@ async fn reindexing_reproduces_each_baseline() {
         let dir = tempfile::tempdir().expect("tempdir");
         let fresh_path = dir.path().join("reindex.db");
         let fresh_path = fresh_path.to_str().unwrap();
-        reindex(&rpc, &open_db(fresh_path), &runs).await;
+        reindex(&rpc, &open_db(fresh_path).await, &runs).await;
 
         let fresh = Connection::open(fresh_path).expect("open re-index");
         let (diffs, compared) = compare(&baseline, &fresh);
@@ -299,7 +302,7 @@ async fn build_baseline() {
         Err(_) => RICH_RANGES.to_vec(),
     };
     eprintln!("{path}: indexing {runs:?}");
-    reindex(&rpc(), &open_db(&path), &runs).await;
+    reindex(&rpc(), &open_db(&path).await, &runs).await;
     let conn = Connection::open(&path).unwrap();
     for table in [
         "blocks",

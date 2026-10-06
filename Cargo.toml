@@ -37,6 +37,11 @@ alloy-primitives = "1"
 alloy-sol-types = "1"
 alloy-consensus = "2"
 
+[features]
+# Records which `db` functions ran, for the gate that every one runs on both
+# backends (src/db/mod.rs, `coverage`).
+db-coverage = []
+
 [dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile = "3"

@@ -422,7 +422,10 @@ pub fn open(path: &str) -> Result<Db> {
     Ok(Db(Arc::new(Mutex::new(conn))))
 }
 
+pub(crate) mod extra;
+#[path = "indexer_jobs.rs"]
 mod indexer_jobs;
+#[path = "schema_check.rs"]
 mod schema_check;
 pub use indexer_jobs::{compute_and_store_stats, repair_derived_tables, save_anchoring_window};
 
