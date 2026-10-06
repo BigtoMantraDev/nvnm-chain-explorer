@@ -126,6 +126,22 @@ pub(crate) async fn get_recent_blocks(p: &PgDb, limit: usize) -> Vec<Block> {
     .await
 }
 
+/// The follower's one statement per tick: the newest block, when the stats
+/// were last written, and the schema version.
+pub(crate) async fn follow_point(
+    p: &PgDb,
+) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>)> {
+    q::try_query_opt(
+        &p.read,
+        "follow_point",
+        "SELECT (SELECT MAX(number) FROM blocks),                 (SELECT updated_at FROM kv WHERE key = 'stats'),                 (SELECT MAX(version) FROM schema_migrations)",
+        |q| q,
+        |r| Ok((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?)),
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("follow_point: no row"))
+}
+
 pub(crate) async fn get_kv(p: &PgDb, key: &str) -> Option<String> {
     let key = key.to_string();
     q::query_opt(

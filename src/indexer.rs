@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -675,6 +675,7 @@ struct Indexer {
     bundle_tx: mpsc::Sender<BlockBundle>,
     shutdown: watch::Receiver<bool>,
     tip_lag: Arc<AtomicU64>,
+    sync: SyncTracker,
 }
 
 impl Indexer {
@@ -684,6 +685,7 @@ impl Indexer {
 
     fn set_tip_lag(&self, lag: u64) {
         self.tip_lag.store(lag, Ordering::Relaxed);
+        self.sync.tip_lag(lag);
     }
 
     /// Fetch `from..=to` as multi-block RPC batches, returning bundles in
@@ -907,7 +909,10 @@ async fn backfill_loop(mut ix: Indexer) {
                     break;
                 }
                 match db::try_min_block_number(&ix.db).await {
-                    Ok(min) => frontier = min.map(|n| n as u64),
+                    Ok(min) => {
+                        frontier = min.map(|n| n as u64);
+                        ix.sync.lowest(min);
+                    }
                     Err(e) => warn!("backfill frontier read failed; keeping {frontier:?}: {e:#}"),
                 }
                 continue;
@@ -953,7 +958,10 @@ async fn backfill_loop(mut ix: Indexer) {
 async fn lowest_block(ix: &mut Indexer) -> Option<Option<u64>> {
     loop {
         match db::try_min_block_number(&ix.db).await {
-            Ok(min) => return Some(min.map(|n| n as u64)),
+            Ok(min) => {
+                ix.sync.lowest(min);
+                return Some(min.map(|n| n as u64));
+            }
             Err(e) => {
                 warn!("backfill frontier read failed; retrying: {e:#}");
                 if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
@@ -961,6 +969,79 @@ async fn lowest_block(ix: &mut Indexer) -> Option<Option<u64>> {
                 }
             }
         }
+    }
+}
+
+/// What the indexer reports in `/readyz` for the cutover: read from what its
+/// loops last saw, never from the database.
+#[derive(Clone)]
+struct SyncTracker {
+    db: Db,
+    report: bool,
+    lowest: Arc<AtomicI64>,
+    tip_lag: Arc<AtomicI64>,
+    genesis: Arc<AtomicBool>,
+    anchoring: Arc<AtomicBool>,
+}
+
+impl SyncTracker {
+    fn new(db: Db) -> Self {
+        SyncTracker {
+            report: db::role(&db) == db::Role::Indexer,
+            db,
+            lowest: Arc::new(AtomicI64::new(-1)),
+            tip_lag: Arc::new(AtomicI64::new(-1)),
+            genesis: Arc::new(AtomicBool::new(false)),
+            anchoring: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn lowest(&self, min: Option<i64>) {
+        self.lowest.store(min.unwrap_or(-1), Ordering::Relaxed);
+        self.publish();
+    }
+
+    fn reached_block_one(&self) -> bool {
+        self.lowest.load(Ordering::Relaxed) == 1
+    }
+
+    fn tip_lag(&self, lag: u64) {
+        self.tip_lag.store(lag as i64, Ordering::Relaxed);
+        self.publish();
+    }
+
+    fn genesis_done(&self) {
+        self.genesis.store(true, Ordering::Relaxed);
+        self.publish();
+    }
+
+    fn anchoring_done(&self) {
+        self.anchoring.store(true, Ordering::Relaxed);
+        self.publish();
+    }
+
+    fn publish(&self) {
+        if !self.report {
+            return;
+        }
+        let known = |v: i64| (v >= 0).then_some(v);
+        let lowest = known(self.lowest.load(Ordering::Relaxed));
+        let tip_lag = known(self.tip_lag.load(Ordering::Relaxed));
+        let genesis = self.genesis.load(Ordering::Relaxed);
+        let anchoring = self.anchoring.load(Ordering::Relaxed);
+        let complete = lowest == Some(1)
+            && tip_lag.is_some_and(|l| l <= TIP_YIELD_LAG as i64)
+            && genesis
+            && anchoring;
+        db::update_status(&self.db, |s| {
+            s.sync = Some(db::Sync {
+                lowest_block: lowest,
+                tip_lag,
+                genesis,
+                anchoring,
+                complete,
+            })
+        });
     }
 }
 
@@ -1073,6 +1154,43 @@ async fn missing_metadata_loop(
     }
 }
 
+/// A core indexer task ended while the process was not shutting down.
+#[derive(Debug)]
+pub struct CoreEnded(pub &'static str);
+
+impl std::fmt::Display for CoreEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the indexer's {} task ended", self.0)
+    }
+}
+
+/// Wait for the first of the core tasks to end. Outside a shutdown that is a
+/// failure, and the process should exit (code 5) so it restarts; during one,
+/// wait for the rest.
+async fn supervise(
+    tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), CoreEnded> {
+    let (names, handles): (Vec<_>, Vec<_>) = tasks.into_iter().unzip();
+    let (result, i, rest) = futures_util::future::select_all(handles).await;
+    if let Err(e) = result {
+        warn!("indexer {} task failed: {e:#}", names[i]);
+    }
+    if *shutdown.borrow() {
+        for task in rest {
+            if let Err(e) = task.await {
+                warn!("indexer task failed while shutting down: {e:#}");
+            }
+        }
+        Ok(())
+    } else {
+        Err(CoreEnded(names[i]))
+    }
+}
+
+/// How long the writer may sit idle before it renews its lease.
+const KEEPALIVE: Duration = Duration::from_secs(10);
+
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
 /// Newly written blocks are broadcast on `block_events` for live viewers.
 pub async fn run_forever(
@@ -1082,8 +1200,9 @@ pub async fn run_forever(
     block_events: broadcast::Sender<Value>,
     stats: Arc<RwLock<Value>>,
     shutdown: watch::Receiver<bool>,
-) {
+) -> Result<(), CoreEnded> {
     let stats_interval = cfg.stats_interval;
+    let sync = SyncTracker::new(db.clone());
     let stats_db = db.clone();
     let stats_events = block_events.clone();
     let stats_shutdown = shutdown.clone();
@@ -1103,6 +1222,7 @@ pub async fn run_forever(
         db.clone(),
         stats_interval,
         shutdown.clone(),
+        sync.clone(),
     ));
     if db::role(&db) == db::Role::Indexer {
         tokio::spawn(missing_metadata_loop(
@@ -1132,9 +1252,12 @@ pub async fn run_forever(
     // Anchoring rows for blocks indexed before the table existed.
     let anchoring_rpc = rpc.clone();
     let anchoring_db = db.clone();
+    let anchoring_sync = sync.clone();
     tokio::spawn(async move {
-        if let Err(e) = backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
-            warn!("anchoring backfill failed: {e:#}");
+        match backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
+            Ok(()) => anchoring_sync.anchoring_done(),
+            // Runs once per start: `sync.anchoring` stays false until a restart.
+            Err(e) => warn!("anchoring backfill failed: {e:#}"),
         }
     });
 
@@ -1152,7 +1275,19 @@ pub async fn run_forever(
     const MAX_BATCH: usize = 64;
 
     let writer = tokio::spawn(async move {
-        while let Some(bundle) = bundle_rx.recv().await {
+        loop {
+            // An idle writer renews its lease, so its session (and the lock)
+            // outlives a quiet chain.
+            let bundle = tokio::select! {
+                bundle = bundle_rx.recv() => match bundle {
+                    Some(bundle) => bundle,
+                    None => break,
+                },
+                _ = tokio::time::sleep(KEEPALIVE) => {
+                    db::keepalive(&writer_db).await;
+                    continue;
+                }
+            };
             // On shutdown, stop draining the queue: in-flight bundles are
             // dropped and re-fetched on the next start.
             if *writer_shutdown.borrow() {
@@ -1189,18 +1324,23 @@ pub async fn run_forever(
         cfg,
         known_tokens,
         bundle_tx: bundle_tx.clone(),
-        shutdown,
+        shutdown: shutdown.clone(),
         tip_lag: Arc::new(AtomicU64::new(0)),
+        sync,
     };
     let forward = tokio::spawn(forward_loop(ix.clone(), block_events));
     let backfill = tokio::spawn(backfill_loop(ix));
     drop(bundle_tx);
 
-    tokio::select! {
-        r = forward => { if let Err(e) = r { warn!("forward loop ended: {e:#}"); } }
-        r = backfill => { if let Err(e) = r { warn!("backfill loop ended: {e:#}"); } }
-    }
-    let _ = writer.await;
+    supervise(
+        vec![
+            ("writer", writer),
+            ("forward", forward),
+            ("backfill", backfill),
+        ],
+        &shutdown,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,10 +1354,16 @@ async fn genesis_loop(
     db: Db,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
+    sync: SyncTracker,
 ) {
     loop {
-        if let Err(e) = add_genesis_balances(&rpc, &db).await {
-            warn!("genesis balances: {e:#}");
+        // Done once a pass that began after backfill reached block 1 finds no
+        // holder left.
+        let after_backfill = sync.reached_block_one();
+        match add_genesis_balances(&rpc, &db).await {
+            Ok(0) if after_backfill => sync.genesis_done(),
+            Ok(_) => {}
+            Err(e) => warn!("genesis balances: {e:#}"),
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
@@ -1225,14 +1371,17 @@ async fn genesis_loop(
     }
 }
 
-/// The transfers indexed since the last pass, a page at a time.
-async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
+/// The transfers indexed since the last pass, a page at a time. Returns how
+/// many holders it found.
+async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<usize> {
+    let mut found = 0;
     while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000).await? {
+        found += holders.len();
         let balances = crate::tokens::balances_at_genesis(rpc, &holders).await?;
         let rows: Vec<_> = holders.into_iter().zip(balances).collect();
         db::save_genesis_balances(db, &rows, cursor).await?;
     }
-    Ok(())
+    Ok(found)
 }
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
@@ -1387,6 +1536,24 @@ mod tests {
         missing_metadata_pass(&db, Vec::new(), &mut retry, &fetch).await;
         assert!(db::get_token_metadata(&db, &b).await.is_some());
         assert!(retry.is_empty());
+    }
+
+    /// The writer, forward and backfill tasks run for the life of the process;
+    /// one that ends outside a shutdown ends the process (exit 5).
+    #[tokio::test]
+    async fn a_core_task_that_ends_is_reported_unless_shutting_down() {
+        let (stop, shutdown) = watch::channel(false);
+        let ended = tokio::spawn(async {});
+        let running = tokio::spawn(std::future::pending::<()>());
+        assert!(
+            supervise(vec![("writer", ended), ("forward", running)], &shutdown)
+                .await
+                .is_err()
+        );
+
+        stop.send(true).unwrap();
+        let ended = tokio::spawn(async {});
+        assert!(supervise(vec![("writer", ended)], &shutdown).await.is_ok());
     }
 
     #[test]

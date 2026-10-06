@@ -416,6 +416,8 @@ async fn answers(db: &Db) -> BTreeMap<String, Value> {
         "tokens_missing_metadata",
         sorted(&db::tokens_missing_metadata(db).await.unwrap()),
     );
+    let (newest, _stats_written_at, version) = db::follow_point(db).await.unwrap();
+    put("follow_point", json!([newest, version]));
     put(
         "compute_and_store_stats",
         stats(&db::compute_and_store_stats(db).await.unwrap()),

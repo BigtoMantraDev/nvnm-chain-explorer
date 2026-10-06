@@ -30,7 +30,7 @@ mod status;
 
 pub use config::{DbConfig, DbTarget, DbUrl, PasswordSource, Role, Tuning};
 pub use pg::DbError;
-pub use status::{Preflight, SchemaVersions, Status, WriterState};
+pub use status::{Preflight, SchemaVersions, Status, Sync, WriterState};
 
 #[doc(hidden)]
 pub use sqlite::{
@@ -127,6 +127,12 @@ async fn seed_labels(db: &Db) -> bool {
             false
         }
     }
+}
+
+/// Re-read every label, merging; what a web replica's follower calls to see
+/// the indexer's inserts and repairs.
+pub async fn reload_labels(db: &Db) -> bool {
+    seed_labels(db).await
 }
 
 const LABEL_RETRY: Duration = Duration::from_secs(30);
@@ -244,7 +250,7 @@ pub fn status(db: &Db) -> watch::Receiver<Status> {
     db.0.status.subscribe()
 }
 
-/// Update the published status.
+/// Update the published status, for the follower and the indexer's sync report.
 pub fn update_status(db: &Db, f: impl FnOnce(&mut Status)) {
     db.0.status.send_modify(f);
 }
@@ -384,6 +390,7 @@ db_fn! {
     extra    fn try_min_block_number() -> Result<Option<i64>>;
     extra    fn tokens_missing_metadata() -> Result<Vec<String>>;
     extra    fn try_all_token_metas() -> Result<Vec<TokenMetadata>>;
+    extra    fn follow_point() -> Result<(Option<i64>, Option<i64>, Option<i64>)>;
 }
 
 // Hand-written, like save_anchoring_window: these three update the label
@@ -505,6 +512,11 @@ pub async fn schema_version(db: &Db) -> Result<i64> {
 #[doc(hidden)]
 pub mod testing {
     use super::*;
+
+    /// Run raw SQL on a SQLite database, to tamper with it in a test.
+    pub fn execute(db: &Db, sql: &str) -> Result<()> {
+        Ok(lock(db).execute_batch(sql)?)
+    }
 
     /// Run `sql` on the writer on the `Long` budget, as migrations and repairs
     /// run: no statement timeout, under the watchdog.

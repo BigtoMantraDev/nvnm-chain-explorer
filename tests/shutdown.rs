@@ -166,6 +166,56 @@ fn sigterm_exits_within_three_seconds_with_a_request_in_flight() {
     let _ = in_flight.read_to_end(&mut rest);
 }
 
+fn http_get(port: u16, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    std::io::Write::write_all(
+        &mut stream,
+        format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .expect("send");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    let code = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (code, response)
+}
+
+/// Probes answer before the database opens: an indexer waiting for an
+/// unreachable database is alive but not ready, and is never restarted for it.
+#[test]
+fn the_port_answers_before_the_database_opens() {
+    let port = free_port();
+    let node = silent_node();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+        .env("ROLE", "indexer")
+        .env(
+            "DATABASE_URL",
+            "postgres://explorer:explorer@127.0.0.1:1/explorer",
+        )
+        .env("HOST", "127.0.0.1")
+        .env("PORT", port.to_string())
+        .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
+        .env("WS_URL", format!("ws://127.0.0.1:{node}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the explorer");
+    wait_until_listening(port);
+    let (alive, _) = http_get(port, "/healthz");
+    let (ready, body) = http_get(port, "/readyz");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(alive, 200);
+    assert_eq!(ready, 503, "{body}");
+    assert!(body.contains("\"preflight\":\"pending\""), "{body}");
+}
+
 /// The 3 s budget holds even when the runtime cannot run: with one worker, and
 /// the database write-locked by the test, the stats task's inline SQLite write
 /// waits out the 5 s busy timeout on that worker, so nothing on the runtime
