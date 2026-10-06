@@ -10,15 +10,22 @@ use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard, RwLock, Weak};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::Connection;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::decoder::checksum_address;
 use crate::models::{AnchoringEvent, Block, BlockBundle, TokenMetadata, Transaction};
 use crate::tokens::TokenMeta;
 
+mod config;
+pub mod migrations;
 mod sqlite;
+mod status;
+
+pub use config::{DbConfig, DbTarget, Role};
+pub use status::{SchemaVersions, Status};
 
 #[doc(hidden)]
 pub use sqlite::{
@@ -33,18 +40,43 @@ pub struct Db(Arc<Inner>);
 struct Inner {
     backend: Backend,
     labels: LabelCache,
+    status: watch::Sender<Status>,
+    role: Role,
 }
 
 enum Backend {
     Sqlite(sqlite::Db),
 }
 
-/// Open (creating if needed) the database at `path` and bring its schema up
-/// to date.
+/// Open a SQLite database as `ROLE=all` and bring its schema up to date,
+/// creating the file if needed.
 pub async fn open(path: &str) -> Result<Db> {
+    let cfg = DbConfig::sqlite(path);
+    open_with(&cfg, watch::channel(Status::starting(Role::All)).0).await
+}
+
+/// Open the configured database for `cfg.role`, publishing progress on
+/// `status`, which `/readyz` reads.
+pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<Db> {
+    let backend = match &cfg.target {
+        DbTarget::Sqlite(path) => {
+            if cfg.role != Role::All {
+                bail!(
+                    "ROLE={} needs Postgres; a SQLite file runs as ROLE=all",
+                    cfg.role
+                );
+            }
+            let s = sqlite::open(path)?;
+            // A file opens only once it is at this binary's version.
+            status.send_modify(|s| s.schema.db = Some(migrations::binary_version()));
+            Backend::Sqlite(s)
+        }
+    };
     let db = Db(Arc::new(Inner {
-        backend: Backend::Sqlite(sqlite::open(path)?),
+        backend,
         labels: LabelCache::new(),
+        status,
+        role: cfg.role,
     }));
     if !seed_labels(&db).await {
         // Every later label change goes through this process's own writes, so
@@ -144,6 +176,21 @@ impl LabelCache {
     }
 }
 
+/// What `/readyz` reports, kept current by the database layer.
+pub fn status(db: &Db) -> watch::Receiver<Status> {
+    db.0.status.subscribe()
+}
+
+/// Update the published status.
+pub fn update_status(db: &Db, f: impl FnOnce(&mut Status)) {
+    db.0.status.send_modify(f);
+}
+
+/// The role this database was opened for.
+pub fn role(db: &Db) -> Role {
+    db.0.role
+}
+
 /// The SQLite connection, for tests that inspect or tamper with rows directly.
 /// Never hold the guard across an `.await`.
 pub fn lock(db: &Db) -> MutexGuard<'_, Connection> {
@@ -236,6 +283,8 @@ db_fn! {
     inline   fn get_address_holdings(address: &str) -> Vec<Value>;
     inline   fn compute_and_store_stats() -> Result<Value>;
     blocking fn repair_derived_tables();
+    extra    fn try_min_block_number() -> Result<Option<i64>>;
+    extra    fn tokens_missing_metadata() -> Vec<String>;
     extra    fn try_all_token_metas() -> Result<Vec<TokenMetadata>>;
 }
 
@@ -289,6 +338,14 @@ pub async fn save_anchoring_window(
     coverage::hit("save_anchoring_window");
     match &db.0.backend {
         Backend::Sqlite(s) => sqlite::save_anchoring_window(s, key, value, events),
+    }
+}
+
+/// D: the database's schema version. An open SQLite file is always at this
+/// binary's version.
+pub async fn schema_version(db: &Db) -> Result<i64> {
+    match &db.0.backend {
+        Backend::Sqlite(_) => Ok(migrations::binary_version()),
     }
 }
 

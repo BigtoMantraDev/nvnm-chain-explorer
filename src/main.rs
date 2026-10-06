@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 
 use nvnmchain_explorer::config::Settings;
-use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::db::{self, Db, DbConfig, DbTarget};
 use nvnmchain_explorer::indexer::{self, IndexerConfig};
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::web;
@@ -22,12 +22,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Settings::from_env();
+    let db_cfg =
+        DbConfig::from_env(|key| std::env::var(key).ok()).context("database configuration")?;
     info!(
         "starting nvnmchain Explorer (rpc={}, db={})",
-        cfg.rpc_url, cfg.db_path
+        cfg.rpc_url,
+        match &db_cfg.target {
+            DbTarget::Sqlite(path) => path.clone(),
+        }
     );
 
-    let db: Db = db::open(&cfg.db_path)
+    let (status_tx, status_rx) = watch::channel(db::Status::starting(db_cfg.role));
+    let db: Db = db::open_with(&db_cfg, status_tx)
         .await
         .context("initialize database")?;
     let rpc = ChainRpc::from_settings(&cfg)?;
@@ -80,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         stats: home_stats,
         shutdown: shutdown_rx.clone(),
     };
-    let app = web::app(state);
+    let app = web::health(status_rx, shutdown_rx.clone()).merge(web::app(state));
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr)

@@ -56,7 +56,12 @@ const COMMIT: usize = 64;
 
 /// Written by the live loops and page views rather than by indexing a block:
 /// watermarks, the stats blob and the selector cache.
-const NOT_INDEXED: &[&str] = &["kv", "selector_names", "sqlite_sequence"];
+const NOT_INDEXED: &[&str] = &[
+    "kv",
+    "schema_migrations",
+    "selector_names",
+    "sqlite_sequence",
+];
 
 /// The most differences printed; the counts per table are always complete.
 const SHOWN: usize = 25;

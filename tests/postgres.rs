@@ -1,11 +1,12 @@
-//! The Postgres schema, `src/db/schema_pg.sql`, against a real server.
+//! The Postgres migrations (`migrations/postgres/`) against a real server.
 //!
-//! - **Idempotence:** applying the file twice changes nothing.
-//! - **Parity:** the file describes what `init_db` creates, except for the
-//!   differences `ALLOWED` names, and spells each expression or partial index
-//!   as `TRANSLATED` pins it.
-//! - **Round-trip:** every baseline fixture's rows survive a copy into it
-//!   unchanged.
+//! - **Idempotence:** applying the baseline, 0001, twice changes nothing.
+//! - **Parity:** after every version N, Postgres (0001..N) has the shape of
+//!   SQLite (`init_db`, then 0002..N), except for the differences `ALLOWED`
+//!   names, and spells each expression or partial index as `TRANSLATED` pins
+//!   it.
+//! - **Round-trip and upgrade:** every baseline fixture's rows survive a copy
+//!   into 0001 and every later version, unchanged.
 //!
 //! Every test is ignored unless run with `--include-ignored`, and then fails
 //! unless `PG_TEST_URL` names a server; a run that ignores them all is not a
@@ -37,9 +38,12 @@ use sqlx::{
 mod common;
 use common::baseline::{columns, diff_rows, row_key, rows, tables, to_json, Rows, Spec, SPECS};
 
-const SCHEMA: &str = include_str!("../src/db/schema_pg.sql");
+use nvnmchain_explorer::db::migrations::{binary_version, MIGRATIONS};
 
-/// The differences between `init_db` and `schema_pg.sql` that are intended:
+/// The baseline, version 1.
+const SCHEMA: &str = include_str!("../migrations/postgres/0001_baseline.sql");
+
+/// The differences between SQLite and Postgres that are intended:
 /// (table, column, field, SQLite, Postgres), and why. Each suppresses that one
 /// difference; one that no longer occurs fails the parity test.
 const ALLOWED: &[(&str, &str, &str, &str, &str, &str)] = &[
@@ -62,8 +66,8 @@ const ALLOWED: &[(&str, &str, &str, &str, &str, &str)] = &[
 ];
 
 /// The expression and partial indexes, which the engines spell differently:
-/// (index, its `sqlite_master.sql` from `init_db`, its `pg_get_indexdef` from
-/// `schema_pg.sql`, unqualified). Compared ignoring case and whitespace
+/// (index, its `sqlite_master.sql` on SQLite, its `pg_get_indexdef` on
+/// Postgres, unqualified). Compared ignoring case and whitespace
 /// outside quotes, each side must match its pin, so a change to either fails
 /// until it is ported to the other and the entry updated. A comment or a
 /// redundant `ASC` in the definition counts as a change too.
@@ -73,7 +77,7 @@ const TRANSLATED: &[(&str, &str, &str)] = &[(
      ON token_balances(token_addr, LENGTH(balance) DESC, balance DESC)
      WHERE balance NOT LIKE '-%'",
     "CREATE INDEX idx_tb_holding ON token_balances USING btree
-     (token_addr, length(balance) DESC, balance DESC)
+     (token_addr, length(balance) DESC, balance DESC, holder_addr)
      WHERE (balance !~~ '-%'::text)",
 )];
 
@@ -138,7 +142,22 @@ impl Scratch {
         sqlx::raw_sql(SCHEMA)
             .execute(&mut self.conn)
             .await
-            .unwrap_or_else(|e| panic!("apply schema_pg.sql: {}", pg_error(&e)));
+            .unwrap_or_else(|e| panic!("apply 0001_baseline.sql: {}", pg_error(&e)));
+    }
+
+    /// Apply the Postgres files of versions `from..=to`, in order.
+    async fn apply_versions(&mut self, from: i64, to: i64) {
+        for m in MIGRATIONS
+            .iter()
+            .filter(|m| (from..=to).contains(&m.version))
+        {
+            sqlx::raw_sql(m.postgres)
+                .execute(&mut self.conn)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("apply {:04}_{}.sql: {}", m.version, m.name, pg_error(&e))
+                });
+        }
     }
 
     /// Drop the schema. Only a passing test calls this, so a failed one
@@ -188,7 +207,7 @@ async fn applying_the_schema_twice_changes_nothing() {
     let mut pg = scratch("idempotence").await;
     pg.apply_schema().await;
     let once = catalog(&mut pg.conn).await;
-    assert!(!once.is_empty(), "schema_pg.sql created nothing");
+    assert!(!once.is_empty(), "0001_baseline.sql created nothing");
     pg.apply_schema().await;
     assert_eq!(catalog(&mut pg.conn).await, once);
     pg.finish().await;
@@ -559,11 +578,11 @@ impl fmt::Display for Diff {
             format!("{}.{}", self.table, self.item)
         };
         match (self.field, self.pg.as_str()) {
-            ("presence", "missing") => write!(f, "{what}: missing from schema_pg.sql"),
-            ("presence", _) => write!(f, "{what}: only in schema_pg.sql"),
+            ("presence", "missing") => write!(f, "{what}: missing on Postgres"),
+            ("presence", _) => write!(f, "{what}: only on Postgres"),
             _ => write!(
                 f,
-                "{what}: {}: init_db {}, schema_pg.sql {}",
+                "{what}: {}: SQLite {}, Postgres {}",
                 self.field, self.sqlite, self.pg
             ),
         }
@@ -716,8 +735,8 @@ fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
         let Some(&(_, s_pin, p_pin)) = TRANSLATED.iter().find(|t| t.0 == name) else {
             let show = |shape| definition(shape, name).unwrap_or_else(|| "none".into());
             out.push(format!(
-                "{what}: an expression or partial index; add it to TRANSLATED: init_db {}, \
-                 schema_pg.sql {}",
+                "{what}: an expression or partial index; add it to TRANSLATED: SQLite {}, \
+                 Postgres {}",
                 show(sqlite),
                 show(pg)
             ));
@@ -725,13 +744,13 @@ fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
         };
         if let Some(s) = definition(sqlite, name).filter(|s| normalize(s) != normalize(s_pin)) {
             out.push(format!(
-                "{what}: init_db definition changed; port it to schema_pg.sql and update \
-                 TRANSLATED: {s}"
+                "{what}: the SQLite definition changed; a migration pair changes both \
+                 sides (docs/database.md), and TRANSLATED with them: {s}"
             ));
         }
         if let Some(p) = definition(pg, name).filter(|p| normalize(p) != normalize(p_pin)) {
             out.push(format!(
-                "{what}: schema_pg.sql definition differs from TRANSLATED: {p}"
+                "{what}: the Postgres definition differs from TRANSLATED: {p}"
             ));
         }
     }
@@ -749,42 +768,52 @@ fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
 
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
-async fn schema_pg_matches_init_db() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("parity.db");
-    let sqlite = sqlite_shape(&nvnmchain_explorer::db::init_db(path.to_str().unwrap()).unwrap());
-
-    let mut pg = scratch("parity").await;
-    pg.apply_schema().await;
-    let postgres = pg_shape(&mut pg.conn).await;
-    let diffs = compare(&sqlite, &postgres);
-
-    let mut problems: Vec<String> = diffs
-        .iter()
-        .filter(|d| {
-            !ALLOWED
-                .iter()
-                .any(|a| (a.0, a.1, a.2, a.3, a.4) == d.tuple())
-        })
-        .map(ToString::to_string)
-        .collect();
-    for a in ALLOWED {
-        if !diffs.iter().any(|d| d.tuple() == (a.0, a.1, a.2, a.3, a.4)) {
-            problems.push(format!(
-                "ALLOWED entry {:?} no longer matches a difference; remove it",
-                (a.0, a.1, a.2, a.3, a.4)
-            ));
+async fn every_version_has_the_same_shape_on_both_backends() {
+    for n in 1..=binary_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parity.db");
+        let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).unwrap();
+        for m in MIGRATIONS.iter().filter(|m| (2..=n).contains(&m.version)) {
+            conn.execute_batch(m.sqlite.expect("a SQLite twin"))
+                .unwrap_or_else(|e| panic!("apply sqlite {:04}_{}.sql: {e}", m.version, m.name));
         }
+        let sqlite = sqlite_shape(&conn);
+
+        let mut pg = scratch(&format!("parity_{n}")).await;
+        pg.apply_versions(1, n).await;
+        let postgres = pg_shape(&mut pg.conn).await;
+        let diffs = compare(&sqlite, &postgres);
+
+        let mut problems: Vec<String> = diffs
+            .iter()
+            .filter(|d| {
+                !ALLOWED
+                    .iter()
+                    .any(|a| (a.0, a.1, a.2, a.3, a.4) == d.tuple())
+            })
+            .map(ToString::to_string)
+            .collect();
+        // ALLOWED describes today's schema; an older version may differ less.
+        if n == binary_version() {
+            for a in ALLOWED {
+                if !diffs.iter().any(|d| d.tuple() == (a.0, a.1, a.2, a.3, a.4)) {
+                    problems.push(format!(
+                        "ALLOWED entry {:?} no longer matches a difference; remove it",
+                        (a.0, a.1, a.2, a.3, a.4)
+                    ));
+                }
+            }
+        }
+        problems.extend(untranslated(&sqlite, &postgres));
+        problems.extend(uncollated(&mut pg.conn).await);
+        assert!(
+            problems.is_empty(),
+            "version {n}: SQLite and Postgres differ; fix the migration pair using the type \
+             rules in docs/superpowers/specs/2026-10-02-schema-two-dialects-design.md:\n{}",
+            problems.join("\n")
+        );
+        pg.finish().await;
     }
-    problems.extend(untranslated(&sqlite, &postgres));
-    problems.extend(uncollated(&mut pg.conn).await);
-    assert!(
-        problems.is_empty(),
-        "schema_pg.sql and init_db differ; port the change using the type rules in \
-         docs/superpowers/specs/2026-10-02-schema-two-dialects-design.md:\n{}",
-        problems.join("\n")
-    );
-    pg.finish().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -955,29 +984,33 @@ async fn every_baseline_round_trips_through_postgres() {
         pg.apply_schema().await;
         let sqlite = open_fixture(&path);
 
-        let (mut diffs, mut copied) = (Vec::new(), 0);
+        let mut copied = Vec::new();
         for table in tables(&sqlite)
             .into_iter()
             .filter(|t| t != "sqlite_sequence")
         {
             let cols = columns(&sqlite, &table);
             let n = copy_table(&mut pg.conn, &sqlite, &table, &cols).await;
-            copied += n;
-            let spec = spec(&table);
+            copied.push((table, cols, n));
+        }
+        // The data upgrade: every later version applies over the copied rows,
+        // and they read back unchanged.
+        pg.apply_versions(2, binary_version()).await;
+
+        let mut diffs = Vec::new();
+        for (table, cols, n) in &copied {
+            let (table, n) = (table.as_str(), *n);
+            let spec = spec(table);
             let (base, back) = (
-                rows(&sqlite, spec, &cols),
-                pg_rows(&mut pg.conn, spec, &cols).await,
+                rows(&sqlite, spec, cols),
+                pg_rows(&mut pg.conn, spec, cols).await,
             );
             assert_eq!(base.len(), n, "{table}: duplicate row keys in the fixture");
-            diffs.extend(diff_rows(
-                &table,
-                &base,
-                &back,
-                ("fixture", "Postgres copy"),
-            ));
+            diffs.extend(diff_rows(table, &base, &back, ("fixture", "Postgres copy")));
         }
 
-        eprintln!("{}: {copied} row(s) copied", path.display());
+        let total: usize = copied.iter().map(|c| c.2).sum();
+        eprintln!("{}: {total} row(s) copied", path.display());
         if diffs.is_empty() {
             pg.finish().await;
         } else {
