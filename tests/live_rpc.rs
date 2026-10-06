@@ -149,7 +149,9 @@ async fn backfill_throughput() {
             let num = next;
             set.spawn(async move {
                 if let Ok(Some(bundle)) = fetch_block_bundle(&rpc, num).await {
-                    let _ = db::save_block_bundle(&db, &bundle);
+                    if let Err(e) = db::save_block_bundle(&db, &bundle) {
+                        eprintln!("block {num} not written: {e:#}");
+                    }
                 }
             });
             next += 1;

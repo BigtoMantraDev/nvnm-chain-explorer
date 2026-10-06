@@ -41,9 +41,8 @@ async fn main() -> anyhow::Result<()> {
     // in-order emission and the SSE lag-replay, live viewers never see gaps.
     let (block_tx, _) = broadcast::channel::<serde_json::Value>(8192);
     let indexer_block_tx = block_tx.clone();
-    // Ctrl+C (or SIGTERM via the graceful-shutdown future) flips this watch;
-    // every indexer loop checks it so the process stops promptly instead of
-    // continuing to fetch/index for minutes.
+    // Ctrl+C (or SIGTERM) flips this watch; every indexer loop checks it so
+    // the process stops promptly instead of continuing to fetch and index.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let indexer_shutdown = shutdown_rx.clone();
     // Home-page stats live here; the stats task refreshes them, the web
@@ -84,48 +83,46 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     info!("listening on http://{addr}");
+    let mut stop = shutdown_rx.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = stop.wait_for(|&stop| stop).await;
+    });
+    let mut server = tokio::spawn(async move { server.await });
+
+    let sig = tokio::select! {
+        r = &mut server => {
+            r.context("server task")?.context("server error")?;
+            anyhow::bail!("server stopped without a shutdown signal");
+        }
+        sig = shutdown_signal() => sig,
+    };
+    info!("received {sig}, shutting down (second one force quits)");
+    let _ = shutdown_tx.send(true);
+    // The installed handler replaced the default disposition for good, so
+    // signals no longer kill the process; catch a second one ourselves.
+    tokio::spawn(async {
         let sig = shutdown_signal().await;
-        info!("received {sig}, shutting down (second one force quits)");
-        let _ = shutdown_tx.send(true);
-        // The installed handler replaced the default disposition for good, so
-        // signals no longer kill the process; catch a second one ourselves.
-        tokio::spawn(async {
-            let sig = shutdown_signal().await;
-            warn!("received {sig} again, exiting now");
-            std::process::exit(130);
-        });
+        warn!("received {sig} again, exiting now");
+        std::process::exit(130);
     });
 
-    tokio::select! {
-        r = server => r.context("server error")?,
-        // Backstop: graceful shutdown waits on in-flight connections, and a
-        // streaming handler could hold it open indefinitely.
-        _ = shutdown_deadline(shutdown_rx) => {
-            warn!("connections still open {GRACE_SECS}s after shutdown; exiting anyway");
-        }
+    // One budget for in-flight connections and the indexer loops together.
+    // A batch cut short here is replayed on the next start. Dropping the
+    // runtime instead would wait on blocking tasks with no bound at all.
+    let drained = tokio::time::timeout(Duration::from_secs(SHUTDOWN_SECS), async {
+        let _ = server.await;
+        let _ = indexer_task.await;
+    })
+    .await;
+    if drained.is_err() {
+        warn!("still busy {SHUTDOWN_SECS}s after {sig}; exiting anyway");
     }
-
-    // The indexer loops exit on the shutdown signal; give them a bounded
-    // window to flush in-flight work, then exit regardless.
-    info!("server stopped; waiting for indexer shutdown");
-    let _ = tokio::time::timeout(Duration::from_secs(10), indexer_task).await;
     info!("shutdown complete");
-    Ok(())
+    std::process::exit(0)
 }
 
-/// How long graceful shutdown may wait on in-flight connections.
-const GRACE_SECS: u64 = 5;
-
-/// Resolve `GRACE_SECS` after shutdown is requested; never if it isn't.
-async fn shutdown_deadline(mut rx: watch::Receiver<bool>) {
-    if rx.wait_for(|&stop| stop).await.is_ok() {
-        tokio::time::sleep(Duration::from_secs(GRACE_SECS)).await;
-    } else {
-        // Sender gone without a signal: the server arm settles the race.
-        std::future::pending::<()>().await
-    }
-}
+/// How long shutdown may take, from the signal to the process exiting.
+const SHUTDOWN_SECS: u64 = 3;
 
 /// Wait for SIGINT or SIGTERM, returning which arrived.
 async fn shutdown_signal() -> &'static str {
