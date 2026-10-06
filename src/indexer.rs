@@ -7,6 +7,7 @@
 //! left idle; backfill yields the RPC when the tip falls behind.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,7 +27,7 @@ use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::summary::ZERO_ADDRESS;
-use crate::tokens::{fetch_token_metadata, has_control_chars};
+use crate::tokens::{fetch_token_metadata, has_control_chars, TokenMeta};
 
 /// How many blocks share one JSON-RPC HTTP request. Sixteen empty blocks
 /// (32 methods when receipts are included) measured at ~265ms against the
@@ -883,7 +884,11 @@ async fn backfill_loop(mut ix: Indexer) {
     // In-memory descending frontier: advancing this without waiting for the
     // writer lets the next fetch overlap the previous commit. Writes are
     // idempotent, so a crash just re-fetches the last in-flight batch.
-    let mut frontier: Option<u64> = db::get_min_block_number(&ix.db).await.map(|n| n as u64);
+    // Read through `try_min_block_number`: an outage must never read as an
+    // empty table, or backfill would start over from the head.
+    let Some(mut frontier) = lowest_block(&mut ix).await else {
+        return;
+    };
     let mut consecutive_failures = 0u32;
     loop {
         if ix.shutting_down() {
@@ -901,7 +906,10 @@ async fn backfill_loop(mut ix: Indexer) {
                 if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
                     break;
                 }
-                frontier = db::get_min_block_number(&ix.db).await.map(|n| n as u64);
+                match db::try_min_block_number(&ix.db).await {
+                    Ok(min) => frontier = min.map(|n| n as u64),
+                    Err(e) => warn!("backfill frontier read failed; keeping {frontier:?}: {e:#}"),
+                }
                 continue;
             }
             None => match ix.rpc.eth_block_number().await {
@@ -939,6 +947,79 @@ async fn backfill_loop(mut ix: Indexer) {
     }
 }
 
+/// The lowest stored block, retried until it reads: on an error there is no
+/// frontier to fall back to, and `None` would mean "start from the head".
+/// `None` only on shutdown.
+async fn lowest_block(ix: &mut Indexer) -> Option<Option<u64>> {
+    loop {
+        match db::try_min_block_number(&ix.db).await {
+            Ok(min) => return Some(min.map(|n| n as u64)),
+            Err(e) => {
+                warn!("backfill frontier read failed; retrying: {e:#}");
+                if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// One pass of the missing-metadata job: fetch each candidate, and each
+/// address an earlier pass could not, and save the ones that are tokens. An
+/// address that answers to neither name nor symbol is not a token, and is
+/// dropped; one whose fetch failed is kept for the next pass.
+async fn missing_metadata_pass<F, Fut>(
+    db: &Db,
+    candidates: Vec<String>,
+    retry: &mut HashSet<String>,
+    fetch: &F,
+) where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<TokenMeta>>,
+{
+    let wanted: HashSet<String> = retry.drain().chain(candidates).collect();
+    for addr in wanted {
+        match fetch(addr.clone()).await {
+            Ok(meta) if meta.name.is_empty() && meta.symbol.is_empty() => {}
+            Ok(meta) => {
+                if let Err(e) = db::save_token_metadata(db, &meta).await {
+                    warn!("token metadata for {addr} not saved: {e:#}");
+                    retry.insert(addr);
+                }
+            }
+            Err(e) => {
+                warn!("token metadata for {addr} unavailable: {e:#}");
+                retry.insert(addr);
+            }
+        }
+    }
+}
+
+/// Under `ROLE=indexer`, web replicas write no chain data, so a token whose
+/// metadata fetch failed while indexing has no page view to repair it. This
+/// job does: a full scan once at start, then, on each stats interval, the
+/// addresses committed bundles named that have no metadata.
+async fn missing_metadata_loop(
+    rpc: ChainRpc,
+    db: Db,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let fetch = |addr: String| {
+        let rpc = rpc.clone();
+        async move { fetch_token_metadata(&rpc, &addr).await }
+    };
+    let mut retry = HashSet::new();
+    let mut candidates = db::tokens_missing_metadata(&db).await;
+    loop {
+        candidates.extend(db::take_tokens_without_metadata(&db));
+        missing_metadata_pass(&db, std::mem::take(&mut candidates), &mut retry, &fetch).await;
+        if sleep_or_shutdown(&mut shutdown, interval).await {
+            break;
+        }
+    }
+}
+
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
 /// Newly written blocks are broadcast on `block_events` for live viewers.
 pub async fn run_forever(
@@ -970,6 +1051,14 @@ pub async fn run_forever(
         stats_interval,
         shutdown.clone(),
     ));
+    if db::role(&db) == db::Role::Indexer {
+        tokio::spawn(missing_metadata_loop(
+            rpc.clone(),
+            db.clone(),
+            stats_interval,
+            shutdown.clone(),
+        ));
+    }
 
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
@@ -1162,6 +1251,65 @@ mod tests {
 
         let wanted = tokens_to_fetch(&[bundle], &known);
         assert_eq!(wanted, [minted, burned].map(String::from).into());
+    }
+
+    fn token(address: &str, symbol: &str) -> TokenMeta {
+        TokenMeta {
+            address: checksum_address(address),
+            name: String::new(),
+            symbol: symbol.into(),
+            decimals: 0,
+            currency: String::new(),
+            total_supply: "0".into(),
+        }
+    }
+
+    /// One pass saves what it can fetch and keeps the rest for the next pass;
+    /// an address that answers as no token is dropped, not retried forever.
+    #[tokio::test]
+    async fn the_missing_metadata_job_retries_what_it_could_not_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open(dir.path().join("m.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let (a, b, c) = (
+            checksum_address("0x20c0000000000000000000000000000000000001"),
+            checksum_address("0x20c0000000000000000000000000000000000002"),
+            checksum_address("0x20c0000000000000000000000000000000000003"),
+        );
+        let reachable = Arc::new(Mutex::new(HashSet::from([a.clone(), c.clone()])));
+        let fetch = |addr: String| {
+            let reachable = reachable.clone();
+            async move {
+                if !reachable.lock().unwrap().contains(&addr) {
+                    anyhow::bail!("node down");
+                }
+                Ok(if addr.ends_with('3') {
+                    token(&addr, "")
+                } else {
+                    token(&addr, "SYM")
+                })
+            }
+        };
+        let mut retry = HashSet::new();
+        missing_metadata_pass(
+            &db,
+            vec![a.clone(), b.clone(), c.clone()],
+            &mut retry,
+            &fetch,
+        )
+        .await;
+        assert!(db::get_token_metadata(&db, &a).await.is_some());
+        assert!(
+            db::get_token_metadata(&db, &c).await.is_none(),
+            "not a token"
+        );
+        assert_eq!(retry, HashSet::from([b.clone()]));
+
+        reachable.lock().unwrap().insert(b.clone());
+        missing_metadata_pass(&db, Vec::new(), &mut retry, &fetch).await;
+        assert!(db::get_token_metadata(&db, &b).await.is_some());
+        assert!(retry.is_empty());
     }
 
     #[test]
