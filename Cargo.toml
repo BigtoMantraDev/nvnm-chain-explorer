@@ -26,6 +26,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
+url = "2"
 # The Postgres backend, without TLS: the database is reached over a private
 # network. Pinned: the writer leans on its connection behaviour
 # (docs/superpowers/specs/2026-10-03-postgres-backend-design.md).

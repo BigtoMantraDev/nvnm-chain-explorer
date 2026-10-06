@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::{error, info, warn};
 
 use nvnmchain_explorer::config::Settings;
-use nvnmchain_explorer::db::{self, Db, DbConfig, DbTarget};
+use nvnmchain_explorer::db::{self, Db, DbConfig, DbTarget, Role};
 use nvnmchain_explorer::indexer::{self, IndexerConfig};
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::web;
@@ -24,11 +24,22 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Settings::from_env();
     let db_cfg =
         DbConfig::from_env(|key| std::env::var(key).ok()).context("database configuration")?;
+    // The database layer knows the split roles; this process runs only the
+    // single-process one until they land.
+    if db_cfg.role != Role::All {
+        anyhow::bail!("ROLE={} is not available yet; run as ROLE=all", db_cfg.role);
+    }
+    // Until the indexer's jobs run on it, Postgres is for the test suites only.
+    if matches!(db_cfg.target, DbTarget::Postgres(_)) {
+        anyhow::bail!("DATABASE_URL: the Postgres backend is not available yet; use DB_PATH");
+    }
     info!(
         "starting nvnmchain Explorer (rpc={}, db={})",
         cfg.rpc_url,
         match &db_cfg.target {
             DbTarget::Sqlite(path) => path.clone(),
+            // `DbUrl` never shows a password.
+            DbTarget::Postgres(url) => url.to_string(),
         }
     );
 

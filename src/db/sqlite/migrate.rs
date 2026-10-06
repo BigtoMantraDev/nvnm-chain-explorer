@@ -295,6 +295,24 @@ mod tests {
         assert!(!has_table(&conn, "schema_migrations"));
     }
 
+    /// The Postgres reads spell their column lists as macros, since sqlx takes
+    /// only `&'static str`; each must stay equal to its SQLite constant.
+    #[test]
+    fn the_column_lists_are_the_same_on_both_backends() {
+        use crate::db::pg::shared::{
+            block_cols, holding, token_cols, transfer_cols, tx_cols, tx_list_cols,
+        };
+        use crate::db::sqlite::{
+            BLOCK_COLS, HOLDING, TOKEN_COLS, TRANSFER_COLS, TX_COLS, TX_LIST_COLS,
+        };
+        assert_eq!(block_cols!(), BLOCK_COLS);
+        assert_eq!(tx_cols!(), TX_COLS);
+        assert_eq!(tx_list_cols!(), TX_LIST_COLS);
+        assert_eq!(token_cols!(), TOKEN_COLS);
+        assert_eq!(transfer_cols!(), TRANSFER_COLS);
+        assert_eq!(holding!(), HOLDING);
+    }
+
     /// The commute rule: `init_db` runs on every open, so after each version a
     /// second `init_db` must change nothing.
     #[test]

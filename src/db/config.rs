@@ -42,8 +42,119 @@ impl fmt::Display for Role {
 /// The database to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DbTarget {
-    /// A SQLite file path, from `DB_PATH`.
+    /// A SQLite file path, from `DB_PATH` or a string that is not a URL.
     Sqlite(String),
+    /// A Postgres URL, always with its scheme.
+    Postgres(DbUrl),
+}
+
+impl DbTarget {
+    /// Tell a Postgres URL from a SQLite path. `postgres://` and
+    /// `postgresql://` are Postgres, and so is `[user[:password]@]host:port`
+    /// with an optional `/dbname` and `?params`, which gains the scheme.
+    /// Anything else is a path. A string that looks like Postgres but does
+    /// not parse is an error, never a file.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let url = if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+            raw.to_string()
+        } else if looks_like_host_port(raw) {
+            format!("postgres://{raw}")
+        } else {
+            return Ok(DbTarget::Sqlite(raw.to_string()));
+        };
+        url::Url::parse(&url).context("not a valid Postgres URL")?;
+        Ok(DbTarget::Postgres(DbUrl(url)))
+    }
+}
+
+/// `[user[:password]@]host:port[/dbname][?params]`, with the host a DNS name,
+/// an IPv4 address or a bracketed IPv6 address, and the port 1 to 5 digits.
+fn looks_like_host_port(raw: &str) -> bool {
+    let before_query = raw.split('?').next().unwrap_or("");
+    let after_user = match before_query.rsplit_once('@') {
+        Some((user, rest)) if !user.contains('/') => rest,
+        Some(_) => return false,
+        None => before_query,
+    };
+    let host_port = after_user.split('/').next().unwrap_or("");
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once("]:") {
+            Some((v6, port)) if v6.parse::<std::net::Ipv6Addr>().is_ok() => (v6, port),
+            _ => return false,
+        }
+    } else {
+        match host_port.rsplit_once(':') {
+            Some(parts) => parts,
+            None => return false,
+        }
+    };
+    let host_ok = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':');
+    let port_ok = (1..=5).contains(&port.len()) && port.chars().all(|c| c.is_ascii_digit());
+    host_ok && port_ok
+}
+
+/// A Postgres URL whose `Display` and `Debug` never show a password written
+/// into it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DbUrl(pub String);
+
+impl DbUrl {
+    pub fn has_password(&self) -> bool {
+        url::Url::parse(&self.0).is_ok_and(|u| u.password().is_some())
+    }
+
+    pub fn has_user(&self) -> bool {
+        url::Url::parse(&self.0).is_ok_and(|u| !u.username().is_empty())
+    }
+}
+
+impl fmt::Display for DbUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match url::Url::parse(&self.0) {
+            Ok(mut u) if u.password().is_some() => {
+                let _ = u.set_password(Some("***"));
+                f.write_str(u.as_str())
+            }
+            Ok(_) => f.write_str(&self.0),
+            Err(_) => f.write_str("<unparsable URL>"),
+        }
+    }
+}
+
+impl fmt::Debug for DbUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DbUrl({self})")
+    }
+}
+
+/// A secret that never shows in `Debug`.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Where the password the connection uses came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordSource {
+    None,
+    Env,
+    Url,
+    /// The URL's, with `PGPASSWORD` also set and ignored.
+    UrlOverEnv,
+}
+
+/// Timings and sizes with production defaults, which tests shorten.
+#[derive(Clone, Debug, Default)]
+pub struct Tuning {
+    /// The read pool's size; by role when `None`.
+    pub pool_max: Option<u32>,
 }
 
 /// Everything `db::open_with` needs from the environment.
@@ -51,6 +162,11 @@ pub enum DbTarget {
 pub struct DbConfig {
     pub role: Role,
     pub target: DbTarget,
+    /// `PGUSER`, applied when the URL names no user.
+    pub user: Option<String>,
+    /// `PGPASSWORD`, applied when the URL carries no password.
+    pub password: Option<Secret>,
+    pub tuning: Tuning,
 }
 
 impl DbConfig {
@@ -62,13 +178,28 @@ impl DbConfig {
             Some(raw) => raw.parse().context("ROLE")?,
             None => Role::All,
         };
-        let target = DbTarget::Sqlite(set("DB_PATH").unwrap_or_else(|| "explorer.db".into()));
-        if role != Role::All {
+        let target = match set("DATABASE_URL") {
+            Some(raw) => match DbTarget::parse(raw.trim()).context("DATABASE_URL")? {
+                DbTarget::Sqlite(_) => {
+                    bail!("DATABASE_URL is not a Postgres URL; use DB_PATH for SQLite")
+                }
+                pg => pg,
+            },
+            None => DbTarget::Sqlite(set("DB_PATH").unwrap_or_else(|| "explorer.db".into())),
+        };
+        if role != Role::All && matches!(target, DbTarget::Sqlite(_)) {
             bail!(
-                "ROLE={role} needs Postgres. A SQLite file has one process, which runs as ROLE=all"
+                "ROLE={role} needs Postgres: set DATABASE_URL. A SQLite file has one \
+                 process, which runs as ROLE=all"
             );
         }
-        Ok(DbConfig { role, target })
+        Ok(DbConfig {
+            role,
+            target,
+            user: set("PGUSER"),
+            password: lookup("PGPASSWORD").filter(|p| !p.is_empty()).map(Secret),
+            tuning: Tuning::default(),
+        })
     }
 
     /// A SQLite configuration, as `db::open(path)` uses.
@@ -76,7 +207,64 @@ impl DbConfig {
         DbConfig {
             role: Role::All,
             target: DbTarget::Sqlite(path.to_string()),
+            user: None,
+            password: None,
+            tuning: Tuning::default(),
         }
+    }
+
+    /// A Postgres configuration with credentials from the process
+    /// environment, as `db::open(url)` uses.
+    pub fn postgres(url: DbUrl, role: Role) -> Self {
+        let env = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        DbConfig {
+            role,
+            target: DbTarget::Postgres(url),
+            user: env("PGUSER"),
+            password: env("PGPASSWORD").map(Secret),
+            tuning: Tuning::default(),
+        }
+    }
+
+    pub fn password_source(&self) -> PasswordSource {
+        let in_url = matches!(&self.target, DbTarget::Postgres(u) if u.has_password());
+        match (in_url, self.password.is_some()) {
+            (true, true) => PasswordSource::UrlOverEnv,
+            (true, false) => PasswordSource::Url,
+            (false, true) => PasswordSource::Env,
+            (false, false) => PasswordSource::None,
+        }
+    }
+
+    /// The connect options for the Postgres URL, credentials applied. This
+    /// build has no TLS, so every connection is plaintext: run the database on
+    /// a private network. A URL whose `sslmode` asks for TLS is refused, never
+    /// quietly downgraded.
+    pub fn pg_options(&self) -> Result<sqlx::postgres::PgConnectOptions> {
+        use sqlx::postgres::{PgConnectOptions, PgSslMode};
+        let DbTarget::Postgres(url) = &self.target else {
+            bail!("not a Postgres configuration");
+        };
+        let mut opts: PgConnectOptions = url.0.parse().with_context(|| format!("parse {url}"))?;
+        if !url.has_user() {
+            if let Some(user) = &self.user {
+                opts = opts.username(user);
+            }
+        }
+        if !url.has_password() {
+            if let Some(Secret(password)) = &self.password {
+                opts = opts.password(password);
+            }
+        }
+        match opts.get_ssl_mode() {
+            PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer => {}
+            mode => bail!(
+                "{url}: sslmode={} needs TLS, which this build does not support; \
+                 connect over a private network with no sslmode (or sslmode=disable)",
+                format!("{mode:?}").to_lowercase()
+            ),
+        }
+        Ok(opts.ssl_mode(PgSslMode::Disable))
     }
 }
 
@@ -120,12 +308,194 @@ mod tests {
         );
     }
 
+    /// Every example in both directions: these are Postgres, normalized to a
+    /// `postgres://` URL...
+    #[test]
+    fn host_and_port_is_a_postgres_url() {
+        for (raw, url) in [
+            (
+                "postgres://db.internal:5432/x",
+                "postgres://db.internal:5432/x",
+            ),
+            ("postgresql://db.internal/x", "postgresql://db.internal/x"),
+            ("localhost:5432", "postgres://localhost:5432"),
+            (
+                "127.0.0.1:5432/explorer",
+                "postgres://127.0.0.1:5432/explorer",
+            ),
+            ("[::1]:5432", "postgres://[::1]:5432"),
+            (
+                "explorer:explorer@localhost:5432/explorer",
+                "postgres://explorer:explorer@localhost:5432/explorer",
+            ),
+            (
+                "db.internal:5432/explorer?sslmode=disable",
+                "postgres://db.internal:5432/explorer?sslmode=disable",
+            ),
+        ] {
+            assert_eq!(
+                DbTarget::parse(raw).unwrap(),
+                DbTarget::Postgres(DbUrl(url.into())),
+                "{raw}"
+            );
+        }
+    }
+
+    /// ...and these are SQLite paths.
+    #[test]
+    fn anything_else_is_a_sqlite_path() {
+        for raw in [
+            "explorer.db",
+            "/data/explorer.db",
+            ":memory:",
+            "C:\\data\\explorer.db",
+            "localhost",
+            "file:x.db",
+        ] {
+            assert_eq!(
+                DbTarget::parse(raw).unwrap(),
+                DbTarget::Sqlite(raw.into()),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_postgres_string_that_does_not_parse_is_an_error_not_a_file() {
+        assert!(DbTarget::parse("postgres://[::1:5432/x").is_err());
+    }
+
+    #[test]
+    fn database_url_wins_over_db_path() {
+        let cfg = DbConfig::from_env(env(&[
+            ("DATABASE_URL", "localhost:5432/explorer"),
+            ("DB_PATH", "/data/explorer.db"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.target,
+            DbTarget::Postgres(DbUrl("postgres://localhost:5432/explorer".into()))
+        );
+    }
+
+    #[test]
+    fn database_url_must_name_postgres() {
+        let err = DbConfig::from_env(env(&[("DATABASE_URL", "/data/explorer.db")])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("use DB_PATH for SQLite"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_password_never_shows_in_a_url_display() {
+        for raw in [
+            "postgres://explorer:s3cret@localhost:5432/explorer",
+            "explorer:s3cret@localhost:5432/explorer",
+        ] {
+            let DbTarget::Postgres(url) = DbTarget::parse(raw).unwrap() else {
+                panic!("{raw}");
+            };
+            assert!(!format!("{url}").contains("s3cret"), "{url}");
+            assert!(!format!("{url:?}").contains("s3cret"), "{url:?}");
+            assert!(format!("{url}").contains("localhost:5432"), "{url}");
+        }
+    }
+
+    /// The manifests put credentials in PGUSER and PGPASSWORD, never the URL.
+    #[test]
+    fn credentials_come_from_pguser_and_pgpassword() {
+        let cfg = DbConfig::from_env(env(&[
+            ("DATABASE_URL", "postgres://db.internal:5432/explorer"),
+            ("PGUSER", "explorer_indexer"),
+            ("PGPASSWORD", "from-secret-manager"),
+        ]))
+        .unwrap();
+        let opts = cfg.pg_options().unwrap();
+        assert_eq!(opts.get_username(), "explorer_indexer");
+        assert_eq!(cfg.password_source(), PasswordSource::Env);
+    }
+
+    /// Local runs may write them into the URL, which then wins.
+    #[test]
+    fn credentials_in_the_url_win() {
+        let cfg = DbConfig::from_env(env(&[
+            (
+                "DATABASE_URL",
+                "postgres://explorer:explorer@localhost:5432/explorer",
+            ),
+            ("PGUSER", "someone_else"),
+            ("PGPASSWORD", "other"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.pg_options().unwrap().get_username(), "explorer");
+        assert_eq!(cfg.password_source(), PasswordSource::UrlOverEnv);
+    }
+
+    #[test]
+    fn no_credentials_anywhere_is_left_to_the_server() {
+        let cfg = DbConfig::from_env(env(&[("DATABASE_URL", "localhost:5432")])).unwrap();
+        assert_eq!(cfg.password_source(), PasswordSource::None);
+        assert!(!format!("{cfg:?}").contains("PGPASSWORD="));
+    }
+
+    #[test]
+    fn a_password_never_shows_in_the_config() {
+        let cfg = DbConfig::from_env(env(&[
+            ("DATABASE_URL", "postgres://db.internal:5432/x"),
+            ("PGPASSWORD", "from-secret-manager"),
+        ]))
+        .unwrap();
+        assert!(
+            !format!("{cfg:?}").contains("from-secret-manager"),
+            "{cfg:?}"
+        );
+    }
+
+    /// This build has no TLS: every connection is plaintext, so a URL that asks
+    /// for TLS is refused rather than quietly downgraded.
+    #[test]
+    fn connections_are_plaintext_and_a_url_asking_for_tls_is_refused() {
+        for url in [
+            "postgres://db.internal:5432/x",
+            "postgres://db.internal:5432/x?sslmode=disable",
+            "postgres://db.internal:5432/x?sslmode=prefer",
+            "postgres://localhost:5432/x",
+            "postgres:///x?host=/var/run/postgresql",
+        ] {
+            let cfg = DbConfig::from_env(env(&[("DATABASE_URL", url)])).unwrap();
+            let opts = cfg.pg_options().unwrap_or_else(|e| panic!("{url}: {e:#}"));
+            assert!(
+                matches!(opts.get_ssl_mode(), sqlx::postgres::PgSslMode::Disable),
+                "{url}"
+            );
+        }
+        for url in [
+            "postgres://db.internal:5432/x?sslmode=require",
+            "postgres://db.internal:5432/x?sslmode=verify-ca",
+            "postgres://db.internal:5432/x?sslmode=verify-full",
+        ] {
+            let cfg = DbConfig::from_env(env(&[("DATABASE_URL", url)])).unwrap();
+            let err = format!("{:#}", cfg.pg_options().unwrap_err());
+            assert!(err.contains("TLS"), "{url}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_split_roles_run_on_postgres() {
+        for (raw, role) in [("web", Role::Web), ("indexer", Role::Indexer)] {
+            let cfg = DbConfig::from_env(env(&[("ROLE", raw), ("DATABASE_URL", "localhost:5432")]))
+                .unwrap();
+            assert_eq!(cfg.role, role);
+        }
+    }
+
     /// One process owns a SQLite file; the split roles need a server.
     #[test]
     fn the_split_roles_need_postgres() {
         for role in ["web", "indexer"] {
             let err = DbConfig::from_env(env(&[("ROLE", role)])).unwrap_err();
-            assert!(format!("{err:#}").contains("needs Postgres"), "{err:#}");
+            assert!(format!("{err:#}").contains("DATABASE_URL"), "{err:#}");
         }
     }
 }
