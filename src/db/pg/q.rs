@@ -225,6 +225,17 @@ pub(crate) async fn exec(c: &mut PgConnection, what: &str, q: PgQuery) -> Result
         .map_err(|e| DbError::from_sqlx(what, e))
 }
 
+pub(crate) async fn fetch_all(
+    c: &mut PgConnection,
+    what: &str,
+    q: PgQuery,
+) -> Result<Vec<PgRow>, DbError> {
+    count_statement();
+    q.fetch_all(c)
+        .await
+        .map_err(|e| DbError::from_sqlx(what, e))
+}
+
 pub(crate) async fn fetch_optional(
     c: &mut PgConnection,
     what: &str,

@@ -104,7 +104,7 @@ async fn a_second_writer_waits_as_a_candidate_until_the_lock_is_free() {
         .unwrap()
         .unwrap();
     assert_eq!(status.borrow().writer, Some(WriterState::Leader));
-    db::save_block(&second, &bundle(1).block).await.unwrap();
+    db::save_block_bundle(&second, &bundle(1)).await.unwrap();
 }
 
 /// A newer release may lead, and migrate, while a candidate waits: the
@@ -180,11 +180,11 @@ async fn two_indexers_starting_together_migrate_once() {
 async fn a_terminated_session_is_reacquired_without_losing_a_block() {
     let (_scratch, url) = backend::scratch_schema().await;
     let (db, status) = open(&fast(&url, Role::Indexer)).await;
-    db::save_block(&db, &bundle(1).block).await.unwrap();
+    db::save_block_bundle(&db, &bundle(1)).await.unwrap();
     let pid = db::testing::writer_pid(&db).unwrap();
 
     terminate(&url, pid).await;
-    db::save_block(&db, &bundle(2).block).await.unwrap();
+    db::save_block_bundle(&db, &bundle(2)).await.unwrap();
 
     assert_ne!(db::testing::writer_pid(&db).unwrap(), pid, "a new session");
     assert_eq!(status.borrow().writer, Some(WriterState::Leader));
@@ -198,14 +198,14 @@ async fn a_terminated_session_is_reacquired_without_losing_a_block() {
 async fn a_failure_while_reacquiring_is_retried_not_returned() {
     let (_scratch, url) = backend::scratch_schema().await;
     let (db, _status) = open(&fast(&url, Role::Indexer)).await;
-    db::save_block(&db, &bundle(1).block).await.unwrap();
+    db::save_block_bundle(&db, &bundle(1)).await.unwrap();
     let pid = db::testing::writer_pid(&db).unwrap();
 
     exec(&url, "ALTER TABLE kv RENAME TO kv_away").await;
     terminate(&url, pid).await;
     let write = tokio::spawn({
         let db = db.clone();
-        async move { db::save_block(&db, &bundle(2).block).await }
+        async move { db::save_block_bundle(&db, &bundle(2)).await }
     });
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!write.is_finished(), "the write waits rather than failing");
@@ -217,6 +217,37 @@ async fn a_failure_while_reacquiring_is_retried_not_returned() {
         .unwrap()
         .unwrap();
     assert_eq!(count(&url, "SELECT COUNT(*) FROM blocks").await, 2);
+}
+
+/// A write runs on its own task, so a caller that goes away (a closed tab, a
+/// timeout) cannot cut it short.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_dropped_caller_does_not_abort_its_batch() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    let (db, _status) = open(&fast(&url, Role::Indexer)).await;
+    db::save_block_bundle(&db, &bundle(1)).await.unwrap();
+    let pid = db::testing::writer_pid(&db).unwrap();
+    // Slow every block insert, so the caller is gone mid-batch.
+    exec(
+        &url,
+        "CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.05); RETURN NEW; END $$;
+         CREATE TRIGGER slow BEFORE INSERT ON blocks FOR EACH ROW EXECUTE FUNCTION slow();",
+    )
+    .await;
+    let batch: Vec<BlockBundle> = (10..40).map(bundle).collect();
+    let call = db::save_block_bundles(&db, &batch);
+    assert!(tokio::time::timeout(Duration::from_millis(200), call)
+        .await
+        .is_err());
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        count(&url, "SELECT COUNT(*) FROM blocks").await,
+        31,
+        "the batch committed"
+    );
+    assert_eq!(db::testing::writer_pid(&db), Some(pid), "the same session");
 }
 
 /// The lease: a holder that stops talking loses its session to
@@ -234,7 +265,7 @@ async fn an_idle_holder_loses_the_lock_to_its_lease() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(count(&url, &held).await, 0, "the lease expired");
     // And the writer recovers on its next write.
-    db::save_block(&db, &bundle(5).block).await.unwrap();
+    db::save_block_bundle(&db, &bundle(5)).await.unwrap();
 }
 
 /// `writer_seq`: after a re-acquire, the database must be at this process's
@@ -245,18 +276,18 @@ async fn an_idle_holder_loses_the_lock_to_its_lease() {
 async fn a_writer_that_lost_commits_exits_4() {
     let (_scratch, url) = backend::scratch_schema().await;
     let (a, _) = open(&fast(&url, Role::Indexer)).await;
-    db::save_block(&a, &bundle(1).block).await.unwrap();
-    db::save_block(&a, &bundle(2).block).await.unwrap();
+    db::save_block_bundle(&a, &bundle(1)).await.unwrap();
+    db::save_block_bundle(&a, &bundle(2)).await.unwrap();
     let pid = db::testing::writer_pid(&a).unwrap();
 
     // A's session dies with its last batch; B leads and commits past A.
     terminate(&url, pid).await;
     exec(&url, "DELETE FROM blocks WHERE number = 2").await;
     let (b, _) = open(&fast(&url, Role::Indexer)).await;
-    db::save_block(&b, &bundle(3).block).await.unwrap();
+    db::save_block_bundle(&b, &bundle(3)).await.unwrap();
     drop(b);
 
-    let err = db::save_block(&a, &bundle(4).block).await.unwrap_err();
+    let err = db::save_block_bundle(&a, &bundle(4)).await.unwrap_err();
     assert!(
         matches!(err.downcast_ref::<DbError>(), Some(DbError::Fatal(4))),
         "{err:#}"
@@ -271,7 +302,7 @@ async fn a_lost_suffix_exits_4() {
     let (_scratch, url) = backend::scratch_schema().await;
     let (a, _) = open(&fast(&url, Role::Indexer)).await;
     for n in 1..=3 {
-        db::save_block(&a, &bundle(n).block).await.unwrap();
+        db::save_block_bundle(&a, &bundle(n)).await.unwrap();
     }
     let pid = db::testing::writer_pid(&a).unwrap();
     terminate(&url, pid).await;
@@ -283,7 +314,7 @@ async fn a_lost_suffix_exits_4() {
     )
     .await;
 
-    let err = db::save_block(&a, &bundle(4).block).await.unwrap_err();
+    let err = db::save_block_bundle(&a, &bundle(4)).await.unwrap_err();
     assert!(
         matches!(err.downcast_ref::<DbError>(), Some(DbError::Fatal(4))),
         "{err:#}"
@@ -318,7 +349,7 @@ async fn database_errors_never_drop_blocks() {
             let db = db.clone();
             tokio::spawn(async move {
                 for n in 1..=5 {
-                    db::save_block(&db, &bundle(n).block).await.unwrap();
+                    db::save_block_bundle(&db, &bundle(n)).await.unwrap();
                 }
             })
         };
@@ -353,12 +384,12 @@ async fn a_content_error_is_returned() {
         "ALTER TABLE blocks ADD CONSTRAINT small CHECK (number < 100)",
     )
     .await;
-    let err = db::save_block(&db, &bundle(500).block).await.unwrap_err();
+    let err = db::save_block_bundle(&db, &bundle(500)).await.unwrap_err();
     assert!(
         matches!(err.downcast_ref::<DbError>(), Some(DbError::Data(_))),
         "{err:#}"
     );
-    db::save_block(&db, &bundle(5).block).await.unwrap();
+    db::save_block_bundle(&db, &bundle(5)).await.unwrap();
 }
 
 /// Role defaults apply to every connection a role opens, so the pools set

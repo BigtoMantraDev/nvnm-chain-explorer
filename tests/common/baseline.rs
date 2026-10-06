@@ -1,11 +1,14 @@
 //! How a baseline's rows are compared, shared by the re-index check
-//! (`tests/baseline.rs`) and the Postgres round-trip (`tests/postgres.rs`).
+//! (`tests/baseline.rs`), the Postgres round-trip (`tests/postgres.rs`), and
+//! the other suites that compare tables, on one backend or across both.
 
 use std::collections::BTreeMap;
 
 use rusqlite::types::Value as Sql;
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use sqlx::postgres::PgConnection;
+use sqlx::{AssertSqlSafe, Column as _, Row as _, TypeInfo as _};
 
 /// How each table is compared: the natural key rows are matched on, and the
 /// columns that legitimately differ between two runs over the same blocks.
@@ -145,4 +148,41 @@ pub fn diff_rows(table: &str, base: &Rows, new: &Rows, sides: (&str, &str)) -> V
         diffs.push(format!("{table} {key}: only in the {}", sides.1));
     }
     diffs
+}
+
+fn quoted(cols: &[String]) -> String {
+    cols.iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A table's rows read back, converted with the same rules as the fixture's.
+pub async fn pg_rows(conn: &mut PgConnection, spec: &Spec, cols: &[String]) -> Rows {
+    let found = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {} FROM {}",
+        quoted(cols),
+        spec.table
+    )))
+    .fetch_all(conn)
+    .await
+    .unwrap_or_else(|e| panic!("{}: read back: {e}", spec.table));
+    let mut out = Rows::new();
+    for row in &found {
+        let mut fields = BTreeMap::new();
+        for (i, col) in cols.iter().enumerate() {
+            let value = match row.columns()[i].type_info().name() {
+                "INT8" => row.get::<Option<i64>, _>(i).map_or(Sql::Null, Sql::Integer),
+                "TEXT" => row.get::<Option<String>, _>(i).map_or(Sql::Null, Sql::Text),
+                "BYTEA" => row
+                    .get::<Option<Vec<u8>>, _>(i)
+                    .map_or(Sql::Null, Sql::Blob),
+                ty => panic!("{}.{col}: unexpected type {ty}", spec.table),
+            };
+            fields.insert(col.clone(), to_json(col, value));
+        }
+        out.insert(row_key(spec, &fields), fields);
+    }
+    assert_eq!(out.len(), found.len(), "{}: duplicate row keys", spec.table);
+    out
 }
