@@ -21,6 +21,8 @@ spec:
     metadata:
       labels: {app: explorer, role: indexer}
     spec:
+      # The explorer never calls the Kubernetes API, so it gets no token.
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       containers:
         - name: explorer
