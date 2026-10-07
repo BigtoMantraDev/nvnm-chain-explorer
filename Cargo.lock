@@ -3128,6 +3128,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "dotenvy",
  "ethers-core",
  "futures-util",
  "hex",

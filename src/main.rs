@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -18,14 +20,75 @@ use nvnmchain_explorer::indexer::{self, IndexerConfig};
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::{metrics, web};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The settings file goes into the environment before anything reads it,
+/// and before the runtime starts its threads: setting a variable races with
+/// another thread reading one.
+fn main() -> anyhow::Result<()> {
+    let env_file = read_env_file()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start the runtime")?
+        .block_on(run(env_file))
+}
+
+/// Load `ENV_FILE`, or `.env` in the working directory when that is unset,
+/// leaving every variable already set as it is; within the file, a later line
+/// wins. An empty `ENV_FILE` reads nothing, and no `.env` file is no error; a
+/// missing named file or a malformed one is. Returns the file read.
+fn read_env_file() -> anyhow::Result<Option<PathBuf>> {
+    let (path, named) = match std::env::var_os("ENV_FILE") {
+        Some(path) if path.is_empty() => return Ok(None),
+        Some(path) => (PathBuf::from(path), true),
+        None => (PathBuf::from(".env"), false),
+    };
+    // Not a directory of that name, say a virtualenv, nor a file in a
+    // directory this user cannot look into.
+    if !named && !path.is_file() {
+        return Ok(None);
+    }
+    let read = || format!("read {}", path.display());
+    let mut settings: Vec<(String, String)> = Vec::new();
+    for item in dotenvy::from_path_iter(&path).with_context(read)? {
+        match item {
+            Ok(setting) => settings.push(setting),
+            // The parser's message quotes the line, and for an unclosed quote
+            // the rest of the file: a secret, as likely as not.
+            Err(dotenvy::Error::LineParse(..)) => {
+                let after = match settings.last() {
+                    Some((key, _)) => format!("after {key}"),
+                    None => "before the first setting".into(),
+                };
+                anyhow::bail!(
+                    "read {}: a line {after} does not parse (not shown: it may hold a secret)",
+                    path.display()
+                );
+            }
+            Err(e) => return Err(e).with_context(read),
+        }
+    }
+    let mut seen = HashSet::new();
+    for (key, value) in settings.into_iter().rev() {
+        if seen.insert(key.clone()) && std::env::var_os(&key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+    Ok(Some(path))
+}
+
+async fn run(env_file: Option<PathBuf>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nvnmchain_explorer=info".into()),
         )
         .init();
+    if let Some(path) = env_file {
+        info!(
+            "read settings from {}; a variable already set wins over it",
+            path.display()
+        );
+    }
 
     let cfg = Settings::from_env();
     let db_cfg =

@@ -11,6 +11,8 @@ license = "MIT"
 anyhow = "1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["clock"] }
+# `.env`, read at startup. Already built for sqlx.
+dotenvy = "0.15"
 futures-util = "0.3"
 hex = "0.4"
 metrics = "0.24"
