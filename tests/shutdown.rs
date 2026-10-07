@@ -87,6 +87,7 @@ fn sigterm_exits_within_three_seconds_with_a_request_in_flight() {
         std::thread::sleep(Duration::from_millis(20));
     };
     let took = started.elapsed();
+    assert!(status.success(), "a graceful stop, not a crash: {status}");
     assert!(
         took < Duration::from_millis(3_500),
         "exited {took:?} after SIGTERM ({status})"

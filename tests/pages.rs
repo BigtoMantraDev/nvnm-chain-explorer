@@ -309,12 +309,46 @@ async fn the_parent_hash_links_to_the_parent_block() {
     let (_dir, db) = fixture_db();
     let parent = Block {
         number: 99,
-        hash: parent_hash,
+        hash: parent_hash.clone(),
         ..block()
     };
     db::save_block(&db, &parent).expect("block 99");
     let html = block_html(serve_db(db, Value::Null).await).await;
-    assert!(html.contains("href=\"/block/99\""), "the parent by height");
+    // The "prev" step links to 99 too, so check the parent link itself.
+    assert!(
+        html.contains("href=\"/block/99\" class=\"text-blue-400"),
+        "the parent by height"
+    );
+    assert!(!html.contains(&format!("href=\"/block/{parent_hash}\"")));
+}
+
+/// A block at the parent's height with another hash is not the parent: after a
+/// reorg or a partial refresh, the parent hash still links to the hash, while
+/// the "prev" step still goes to the height below.
+#[tokio::test]
+async fn the_parent_hash_never_links_to_another_block_at_its_height() {
+    let parent_hash = format!("0x{}", "cd".repeat(32));
+    let (_dir, db) = fixture_db();
+    let other = Block {
+        number: 99,
+        hash: format!("0x{}", "98".repeat(32)),
+        ..block()
+    };
+    db::save_block(&db, &other).expect("block 99");
+    let base = serve_db(db, Value::Null).await;
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html")
+        .replace("&#x2F;", "/");
+
+    assert!(
+        html.contains(&format!("href=\"/block/{parent_hash}\"")),
+        "99 holds another block, so the link is the hash"
+    );
+    assert!(html.contains("href=\"/block/99\" class=\"step\""), "prev");
 }
 
 /// Newest first, and only the heights the index holds: the fixture has 100 and

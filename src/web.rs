@@ -940,13 +940,19 @@ pub async fn block_page(
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
     // Looked up rather than inferred from the tip: the index has gaps while it
     // backfills, so a number below the tip is not necessarily there to link to.
-    let neighbour = |n: i64| db::get_block_by_number(&state.db, n).map(|b| b.number);
-    let previous = if block.number > 0 {
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n);
+    let below = if block.number > 0 {
         neighbour(block.number - 1)
     } else {
         None
     };
-    let next = neighbour(block.number + 1);
+    let previous = below.as_ref().map(|b| b.number);
+    // The parent hash links by height only to the block it names: after a
+    // reorg or a partial refresh, the row below can hold another block.
+    let parent = below
+        .filter(|b| b.hash.eq_ignore_ascii_case(&block.parent_hash))
+        .map(|b| b.number);
+    let next = neighbour(block.number + 1).map(|b| b.number);
     let ctx = page_ctx(
         &state,
         json!({
@@ -956,6 +962,7 @@ pub async fn block_page(
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
             "previous_block": previous,
+            "parent_block": parent,
             "next_block": next,
         }),
     );

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
@@ -110,8 +110,14 @@ async fn main() -> anyhow::Result<()> {
     // A batch cut short here is replayed on the next start. Dropping the
     // runtime instead would wait on blocking tasks with no bound at all.
     let drained = tokio::time::timeout(Duration::from_secs(SHUTDOWN_SECS), async {
-        let _ = server.await;
-        let _ = indexer_task.await;
+        match server.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("server error while shutting down: {e}"),
+            Err(e) => error!("server task failed while shutting down: {e}"),
+        }
+        if let Err(e) = indexer_task.await {
+            error!("indexer task failed while shutting down: {e}");
+        }
     })
     .await;
     if drained.is_err() {
