@@ -186,31 +186,112 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
     (code, response)
 }
 
+/// A SIGTERM during startup, once the port answers but before the explorer is
+/// running, still stops it cleanly: never fatal, and never lost, which would
+/// leave the pod to Kubernetes' SIGKILL 30 s later. Startup takes tens of
+/// milliseconds here, so each attempt signals a little later into it.
+#[test]
+fn a_sigterm_during_startup_stops_it_cleanly() {
+    for attempt in 0..5u64 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nothing listens there: RPC calls fail at once, so a clean stop is quick.
+        let node = free_port();
+        let port = free_port();
+        let log = dir.path().join("explorer.log");
+        let out = std::fs::File::create(&log).expect("log");
+        // Up before the explorer starts, as starting it takes longer than the
+        // whole window.
+        let sigterm = Sigterm::ready();
+        let mut child = Explorer(
+            Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+                .env("DB_PATH", dir.path().join("startup.db"))
+                .env("HOST", "127.0.0.1")
+                .env("PORT", port.to_string())
+                .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
+                .env("WS_URL", format!("ws://127.0.0.1:{node}"))
+                .env("SIGNATURE_LOOKUP_URL", "")
+                .env_remove("DATABASE_URL")
+                .env_remove("ROLE")
+                .stdout(out.try_clone().expect("log"))
+                .stderr(out)
+                .spawn()
+                .expect("spawn the explorer"),
+        );
+        let output = || std::fs::read_to_string(&log).unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let started = loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break Ok(());
+            }
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Err(format!("exited during startup ({status})"));
+            }
+            if Instant::now() > deadline {
+                break Err("never listened".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if let Err(why) = started {
+            panic!("attempt {attempt}: the explorer {why}:\n{}", output());
+        }
+        std::thread::sleep(Duration::from_millis(15 * attempt));
+        let sent = sigterm.send(child.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(sent, "attempt {attempt}: kill failed");
+        match status {
+            Some(status) => assert!(
+                status.success(),
+                "attempt {attempt}: {status}\n{}",
+                output()
+            ),
+            None => panic!(
+                "attempt {attempt}: still running 10 s after SIGTERM\n{}",
+                output()
+            ),
+        }
+        // Stopped by the drain, not by the deadline thread's exit.
+        assert!(
+            !output().contains("still busy"),
+            "attempt {attempt}: the drain ran out the deadline\n{}",
+            output()
+        );
+    }
+}
+
 /// Probes answer before the database opens: an indexer waiting for an
 /// unreachable database is alive but not ready, and is never restarted for it.
 #[test]
 fn the_port_answers_before_the_database_opens() {
     let port = free_port();
     let node = silent_node();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
-        .env("ROLE", "indexer")
-        .env(
-            "DATABASE_URL",
-            "postgres://explorer:explorer@127.0.0.1:1/explorer",
-        )
-        .env("HOST", "127.0.0.1")
-        .env("PORT", port.to_string())
-        .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
-        .env("WS_URL", format!("ws://127.0.0.1:{node}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the explorer");
+    let _child = Explorer(
+        Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+            .env("ROLE", "indexer")
+            .env(
+                "DATABASE_URL",
+                "postgres://explorer:explorer@127.0.0.1:1/explorer",
+            )
+            .env("HOST", "127.0.0.1")
+            .env("PORT", port.to_string())
+            .env("NVNM_RPC", format!("http://127.0.0.1:{node}"))
+            .env("WS_URL", format!("ws://127.0.0.1:{node}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the explorer"),
+    );
     wait_until_listening(port);
     let (alive, _) = http_get(port, "/healthz");
     let (ready, body) = http_get(port, "/readyz");
-    let _ = child.kill();
-    let _ = child.wait();
     assert_eq!(alive, 200);
     assert_eq!(ready, 503, "{body}");
     assert!(body.contains("\"preflight\":\"pending\""), "{body}");
