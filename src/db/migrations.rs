@@ -91,10 +91,12 @@ pub struct Headers {
 }
 
 /// Read the header block: the `-- key: value` and `-- flag` lines before the
-/// first line that is neither a comment nor blank. Other comments are prose.
+/// first line that is neither a comment nor blank. Other comments are prose,
+/// a `-- kind:` line further down included: the block must name the kind.
 pub fn headers(text: &str) -> (Headers, Vec<String>) {
     let mut h = Headers::default();
     let mut errors = Vec::new();
+    let mut kind_named = false;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -105,16 +107,22 @@ pub fn headers(text: &str) -> (Headers, Vec<String>) {
         };
         let rest = rest.trim();
         match rest.split_once(':') {
-            Some(("kind", v)) => match v.trim() {
-                "expand" => h.kind = Some(Kind::Expand),
-                "contract" => h.kind = Some(Kind::Contract),
-                other => errors.push(format!("unknown kind `{other}`")),
-            },
+            Some(("kind", v)) => {
+                kind_named = true;
+                match v.trim() {
+                    "expand" => h.kind = Some(Kind::Expand),
+                    "contract" => h.kind = Some(Kind::Contract),
+                    other => errors.push(format!("unknown kind `{other}`")),
+                }
+            }
             Some(("noop", v)) => h.noop = Some(v.trim().to_string()),
             _ if rest == "no-transaction" => h.no_transaction = true,
             _ if looks_like_header(rest) => errors.push(format!("unknown header `-- {rest}`")),
             _ => {}
         }
+    }
+    if !kind_named {
+        errors.push("no `-- kind:` header".into());
     }
     (h, errors)
 }
@@ -139,6 +147,33 @@ pub fn statements(text: &str) -> Vec<String> {
         .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// The queries a `-- no-transaction` file is run as: split at a `;` ending a
+/// line, comment lines left out. The runner sends each on its own, so each
+/// must be one statement (`no_transaction_errors`).
+pub fn split_at_line_end(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("--") {
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+        if line.trim_end().ends_with(';') {
+            let stmt = current.trim().trim_end_matches(';').trim().to_string();
+            if !stmt.is_empty() {
+                out.push(stmt);
+            }
+            current.clear();
+        }
+    }
+    let rest = current.trim();
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
 }
 
 /// Whether `stmt` contains the keyword sequence `words`, as whole words and
@@ -197,10 +232,8 @@ pub fn concurrent_indexes(text: &str) -> Vec<String> {
 
 const EXPAND_FORBIDS: &[&str] = &[
     "DROP TABLE",
-    "DROP COLUMN",
     "RENAME",
     "SET NOT NULL",
-    "ALTER COLUMN",
     "TRUNCATE",
     "DELETE FROM",
 ];
@@ -216,12 +249,6 @@ pub fn check_pair(version: i64, name: &str, sqlite: &str, postgres: &str) -> Vec
     let (ph, pe) = headers(postgres);
     errors.extend(se.into_iter().map(|e| at("sqlite", e)));
     errors.extend(pe.into_iter().map(|e| at("postgres", e)));
-    if sh.kind.is_none() && !sqlite.lines().any(|l| l.contains("kind:")) {
-        errors.push(at("sqlite", "no `-- kind:` header".into()));
-    }
-    if ph.kind.is_none() && !postgres.lines().any(|l| l.contains("kind:")) {
-        errors.push(at("postgres", "no `-- kind:` header".into()));
-    }
     if let (Some(a), Some(b)) = (sh.kind, ph.kind) {
         if a != b {
             errors.push(at(
@@ -288,6 +315,11 @@ fn expand_errors(text: &str) -> Vec<String> {
                 errors.push(format!("an expand may not {f}; label it `contract`: {s}"));
             }
         }
+        if alters_existing(s) {
+            errors.push(format!(
+                "an expand may not drop or alter what a table has; label it `contract`: {s}"
+            ));
+        }
         if CONSTRAINTS.iter().any(|c| has(s, c)) {
             let own = if has(s, "CREATE TABLE") {
                 true
@@ -317,10 +349,33 @@ fn expand_errors(text: &str) -> Vec<String> {
     errors
 }
 
+/// Whether an `ALTER TABLE` has a `DROP` or `ALTER` action, which both
+/// engines accept with or without `COLUMN`.
+fn alters_existing(stmt: &str) -> bool {
+    let toks = tokens(stmt);
+    let Some(at) = toks
+        .windows(2)
+        .position(|w| w[0].eq_ignore_ascii_case("ALTER") && w[1].eq_ignore_ascii_case("TABLE"))
+    else {
+        return false;
+    };
+    toks[at + 2..]
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("DROP") || t.eq_ignore_ascii_case("ALTER"))
+}
+
 fn no_transaction_errors(text: &str) -> Vec<String> {
     let mut errors = Vec::new();
     if text.contains("$$") {
         errors.push("no `$$` bodies: statements are split at `;`".into());
+    }
+    for query in split_at_line_end(text) {
+        if statements(&query).len() > 1 {
+            errors.push(format!(
+                "end a statement's last line with its `;`, nothing after it: the runner \
+                 sends what lies between as one query, which `CONCURRENTLY` refuses: {query}"
+            ));
+        }
     }
     let mut dropped = HashSet::new();
     for s in statements(text) {
@@ -436,6 +491,13 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_after_the_header_block_does_not_count() {
+        let late = "DROP TABLE blocks;\n-- kind: expand\n";
+        assert_refused(late, late, "sqlite: no `-- kind:` header");
+        assert_refused(late, late, "postgres: no `-- kind:` header");
+    }
+
+    #[test]
     fn twins_agree_on_their_kind() {
         assert_refused(EXPAND, "-- kind: contract\nDROP TABLE t;", "kinds differ");
     }
@@ -454,8 +516,11 @@ mod tests {
         for body in [
             "DROP TABLE t;",
             "ALTER TABLE t DROP COLUMN c;",
+            "ALTER TABLE t DROP c;",
+            "ALTER TABLE t ADD COLUMN d TEXT, DROP CONSTRAINT k;",
             "ALTER TABLE t RENAME TO u;",
             "ALTER TABLE t ALTER COLUMN c SET NOT NULL;",
+            "ALTER TABLE t ALTER c TYPE TEXT;",
             "TRUNCATE t;",
             "DELETE FROM kv WHERE key = 'x';",
         ] {
@@ -521,6 +586,33 @@ mod tests {
         let pg = "-- kind: expand\n-- no-transaction\nDROP INDEX CONCURRENTLY IF EXISTS x;\n\
                   CREATE INDEX CONCURRENTLY IF NOT EXISTS x ON blocks (miner);\n";
         assert_refused(EXPAND, pg, "IF NOT EXISTS would hide an INVALID index");
+    }
+
+    #[test]
+    fn a_no_transaction_file_ends_each_statement_at_a_line_end() {
+        let one_line = "-- kind: expand\n-- no-transaction\n\
+                        DROP INDEX CONCURRENTLY IF EXISTS x; CREATE INDEX CONCURRENTLY x ON blocks (miner);\n";
+        assert_refused(EXPAND, one_line, "nothing after it");
+        let noted = "-- kind: expand\n-- no-transaction\n\
+                     DROP INDEX CONCURRENTLY IF EXISTS x; -- the old one\n\
+                     CREATE INDEX CONCURRENTLY x ON blocks (miner);\n";
+        assert_refused(EXPAND, noted, "nothing after it");
+        let split = "-- kind: expand\n-- no-transaction\nDROP INDEX CONCURRENTLY IF EXISTS x;\n\
+                     CREATE INDEX CONCURRENTLY x -- by miner\n    ON blocks (miner);\n";
+        assert_eq!(errors(EXPAND, split), Vec::<String>::new());
+    }
+
+    #[test]
+    fn statements_split_at_a_semicolon_ending_a_line() {
+        let text = "-- kind: expand\n-- no-transaction\nDROP INDEX CONCURRENTLY IF EXISTS x;\n\
+                    CREATE INDEX CONCURRENTLY x\n    ON blocks (miner);\n";
+        assert_eq!(
+            split_at_line_end(text),
+            [
+                "DROP INDEX CONCURRENTLY IF EXISTS x",
+                "CREATE INDEX CONCURRENTLY x\n    ON blocks (miner)"
+            ]
+        );
     }
 
     #[test]

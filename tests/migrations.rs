@@ -6,23 +6,80 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use nvnmchain_explorer::db;
+use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, rows, tables, SPECS};
+use common::baseline::{columns, tables};
 
-/// Every table's rows over `cols`, the columns the legacy file had, in a
-/// comparable form.
-fn contents(conn: &Connection, cols: &BTreeMap<&str, Vec<String>>) -> Vec<(String, usize, String)> {
+/// A value as stored, its storage class included: a rewrite to equal-looking
+/// text or JSON still shows.
+fn exact(value: Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => format!("{f:?}"),
+        Value::Text(s) => format!("{s:?}"),
+        Value::Blob(b) => format!("x'{}'", hex::encode(b)),
+    }
+}
+
+/// Every row of every table in `cols`, over its columns there (the ones the
+/// legacy file had), sorted so that only the rows themselves are compared.
+fn contents(
+    conn: &Connection,
+    cols: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for (table, cols) in cols {
+        let list = cols
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn
+            .prepare(&format!("SELECT {list} FROM \"{table}\""))
+            .unwrap();
+        let mut rows: Vec<String> = stmt
+            .query_map([], |r| {
+                (0..cols.len())
+                    .map(|i| Ok(exact(r.get(i)?)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .map(|row| format!("({})", row.unwrap().join(", ")))
+            .collect();
+        rows.sort();
+        out.insert(table.clone(), rows);
+    }
+    out
+}
+
+/// What changed in each table, with a few rows to show it.
+fn changes(
+    before: &BTreeMap<String, Vec<String>>,
+    after: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    for spec in SPECS {
-        let rows = rows(conn, spec, &cols[spec.table]);
-        out.push((
-            spec.table.to_string(),
-            rows.len(),
-            format!("{:?}", rows.iter().take(50).collect::<Vec<_>>()),
-        ));
+    for (table, was) in before {
+        let now = &after[table];
+        if now != was {
+            let only = |a: &[String], b: &[String]| -> Vec<String> {
+                a.iter()
+                    .filter(|r| b.binary_search(r).is_err())
+                    .take(3)
+                    .cloned()
+                    .collect()
+            };
+            out.push(format!(
+                "{table}: {} rows before, {} after; gone {:?}; new {:?}",
+                was.len(),
+                now.len(),
+                only(was, now),
+                only(now, was)
+            ));
+        }
     }
     out
 }
@@ -44,9 +101,13 @@ async fn both_canaries_are_adopted_with_their_rows_intact() {
             !tables(&original).contains(&"schema_migrations".to_string()),
             "{name} must stay a legacy file"
         );
-        let cols: BTreeMap<&str, Vec<String>> = SPECS
-            .iter()
-            .map(|s| (s.table, columns(&original, s.table)))
+        let cols: BTreeMap<String, Vec<String>> = tables(&original)
+            .into_iter()
+            .filter(|t| !t.starts_with("sqlite_"))
+            .map(|t| {
+                let cols = columns(&original, &t);
+                (t, cols)
+            })
             .collect();
         let before = contents(&original, &cols);
 
@@ -73,6 +134,11 @@ async fn both_canaries_are_adopted_with_their_rows_intact() {
             db::migrations::binary_version(),
             "{name}"
         );
-        assert_eq!(contents(&adopted, &cols), before, "{name}: rows changed");
+        let changed = changes(&before, &contents(&adopted, &cols));
+        assert!(
+            changed.is_empty(),
+            "{name}: rows changed:\n{}",
+            changed.join("\n")
+        );
     }
 }

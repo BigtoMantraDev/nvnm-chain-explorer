@@ -3,14 +3,15 @@
 //! - **Idempotence:** applying the baseline, 0001, twice changes nothing.
 //! - **Parity:** after every version N, Postgres (0001..N) has the shape of
 //!   SQLite (`init_db`, then 0002..N), except for the differences `ALLOWED`
-//!   names, and spells each expression or partial index as `TRANSLATED` pins
-//!   it.
+//!   names for N, and spells each expression or partial index as `TRANSLATED`
+//!   pins it for N.
 //! - **Round-trip and upgrade:** every baseline fixture's rows survive a copy
 //!   into 0001 and every later version, unchanged.
 //!
-//! Every test is ignored unless run with `--include-ignored`, and then fails
-//! unless `PG_TEST_URL` names a server; a run that ignores them all is not a
-//! pass. Each test works in a schema of its own, dropped only when it passes.
+//! Every test that needs a server is ignored unless run with
+//! `--include-ignored`, and then fails unless `PG_TEST_URL` names a server; a
+//! run that ignores them all is not a pass. Each test works in a schema of its
+//! own, dropped only when it passes.
 //!
 //! The SQL built at run time is wrapped in `AssertSqlSafe`: it interpolates
 //! only this file's constants and names read from the catalog or a fixture.
@@ -38,15 +39,39 @@ use sqlx::{
 mod common;
 use common::baseline::{columns, diff_rows, row_key, rows, tables, to_json, Rows, Spec, SPECS};
 
-use nvnmchain_explorer::db::migrations::{binary_version, MIGRATIONS};
+use nvnmchain_explorer::db::migrations::{
+    binary_version, check_pair, headers, split_at_line_end, Migration, MIGRATIONS,
+};
 
 /// The baseline, version 1.
 const SCHEMA: &str = include_str!("../migrations/postgres/0001_baseline.sql");
 
+/// The schema versions an `ALLOWED` or `TRANSLATED` entry holds for: `since`
+/// and every later one, up to `until`, the version that changes or removes
+/// what it describes, if one has. Each version is checked against the entries
+/// that hold for it, so an older one keeps the entries it had.
+#[derive(Clone, Copy, Debug)]
+struct Versions {
+    since: i64,
+    until: Option<i64>,
+}
+
+impl Versions {
+    /// `since` and every later version.
+    const fn from(since: i64) -> Self {
+        Versions { since, until: None }
+    }
+
+    fn hold_for(self, n: i64) -> bool {
+        self.since <= n && self.until.is_none_or(|until| n < until)
+    }
+}
+
 /// The differences between SQLite and Postgres that are intended:
-/// (table, column, field, SQLite, Postgres), and why. Each suppresses that one
-/// difference; one that no longer occurs fails the parity test.
-const ALLOWED: &[(&str, &str, &str, &str, &str, &str)] = &[
+/// (table, column, field, SQLite, Postgres), why, and the versions it holds
+/// for. Each suppresses that one difference; one that does not occur at a
+/// version it holds for fails the parity test.
+const ALLOWED: &[(&str, &str, &str, &str, &str, &str, Versions)] = &[
     (
         "token_balances",
         "token_addr",
@@ -54,6 +79,7 @@ const ALLOWED: &[(&str, &str, &str, &str, &str, &str)] = &[
         "bytes",
         "text",
         "declared BLOB on SQLite, but every row holds 0x text",
+        Versions::from(1),
     ),
     (
         "token_balances",
@@ -62,16 +88,19 @@ const ALLOWED: &[(&str, &str, &str, &str, &str, &str)] = &[
         "bytes",
         "text",
         "declared BLOB on SQLite, but every row holds 0x text",
+        Versions::from(1),
     ),
 ];
 
 /// The expression and partial indexes, which the engines spell differently:
 /// (index, its `sqlite_master.sql` on SQLite, its `pg_get_indexdef` on
-/// Postgres, unqualified). Compared ignoring case and whitespace
-/// outside quotes, each side must match its pin, so a change to either fails
-/// until it is ported to the other and the entry updated. A comment or a
-/// redundant `ASC` in the definition counts as a change too.
-const TRANSLATED: &[(&str, &str, &str)] = &[(
+/// Postgres, unqualified, and the versions it holds for). Compared ignoring
+/// case and whitespace outside quotes, each side must match its pin, so a
+/// change to either fails until it is ported to the other. A comment or a
+/// redundant `ASC` in the definition counts as a change too. The version that
+/// changes or drops an index ends its entry there, and pins a changed
+/// definition in a new entry from that version on.
+const TRANSLATED: &[Pin] = &[(
     "idx_tb_holding",
     "CREATE INDEX idx_tb_holding
      ON token_balances(token_addr, LENGTH(balance) DESC, balance DESC)
@@ -79,7 +108,10 @@ const TRANSLATED: &[(&str, &str, &str)] = &[(
     "CREATE INDEX idx_tb_holding ON token_balances USING btree
      (token_addr, length(balance) DESC, balance DESC, holder_addr)
      WHERE (balance !~~ '-%'::text)",
+    Versions::from(1),
 )];
+
+type Pin = (&'static str, &'static str, &'static str, Versions);
 
 /// Row keys for the tables `SPECS` leaves out, which the round-trip copies too.
 const UNINDEXED: &[Spec] = &[
@@ -151,12 +183,32 @@ impl Scratch {
             .iter()
             .filter(|m| (from..=to).contains(&m.version))
         {
-            sqlx::raw_sql(m.postgres)
-                .execute(&mut self.conn)
+            self.apply(m).await;
+        }
+    }
+
+    /// Apply one version's Postgres file as the runner does: a
+    /// `-- no-transaction` one a query at a time, split where the runner
+    /// splits it (one multi-statement query is an implicit transaction, which
+    /// `CONCURRENTLY` refuses), any other in a transaction.
+    async fn apply(&mut self, m: &Migration) {
+        let failed = |e: sqlx::Error| -> ! {
+            panic!("apply {:04}_{}.sql: {}", m.version, m.name, pg_error(&e))
+        };
+        if headers(m.postgres).0.no_transaction {
+            for query in split_at_line_end(m.postgres) {
+                sqlx::raw_sql(AssertSqlSafe(query))
+                    .execute(&mut self.conn)
+                    .await
+                    .unwrap_or_else(|e| failed(e));
+            }
+        } else {
+            let mut tx = self.conn.begin().await.unwrap_or_else(|e| failed(e));
+            sqlx::raw_sql(AssertSqlSafe(m.postgres))
+                .execute(&mut *tx)
                 .await
-                .unwrap_or_else(|e| {
-                    panic!("apply {:04}_{}.sql: {}", m.version, m.name, pg_error(&e))
-                });
+                .unwrap_or_else(|e| failed(e));
+            tx.commit().await.unwrap_or_else(|e| failed(e));
         }
     }
 
@@ -210,6 +262,36 @@ async fn applying_the_schema_twice_changes_nothing() {
     assert!(!once.is_empty(), "0001_baseline.sql created nothing");
     pg.apply_schema().await;
     assert_eq!(catalog(&mut pg.conn).await, once);
+    pg.finish().await;
+}
+
+/// A `-- no-transaction` file the rules accept, here one rebuilding an index,
+/// applies as it would in production.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_no_transaction_file_applies() {
+    let rebuild = Migration {
+        version: 2,
+        name: "rebuild",
+        sqlite: Some("-- kind: expand\n-- noop: postgres-only\n"),
+        postgres: "-- kind: expand\n-- no-transaction\n\
+                   DROP INDEX CONCURRENTLY IF EXISTS idx_blocks_miner_v2;\n\
+                   CREATE INDEX CONCURRENTLY idx_blocks_miner_v2 ON blocks (miner);\n",
+    };
+    let rules = check_pair(2, rebuild.name, rebuild.sqlite.unwrap(), rebuild.postgres);
+    assert_eq!(rules, Vec::<String>::new());
+    let mut pg = scratch("no_transaction").await;
+    pg.apply_schema().await;
+    pg.apply(&rebuild).await;
+    let built: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes
+                        WHERE schemaname = current_schema()
+                          AND indexname = 'idx_blocks_miner_v2')",
+    )
+    .fetch_one(&mut pg.conn)
+    .await
+    .unwrap();
+    assert!(built, "the index was not built");
     pg.finish().await;
 }
 
@@ -709,13 +791,14 @@ fn normalize(sql: &str) -> String {
     out
 }
 
-/// Every expression or partial index whose definition on either side is not
-/// the one `TRANSLATED` pins, or that has no entry, and every entry that no
-/// longer names one of `init_db`'s.
-fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
+/// At version `n`: every expression or partial index whose definition on
+/// either side is not the one its pin for `n` holds, or that has no pin or
+/// more than one, and every pin for `n` that names none.
+fn untranslated(sqlite: &Shape, pg: &Shape, pins: &[Pin], n: i64) -> Vec<String> {
     let definition = |shape: &Shape, name: &str| -> Option<String> {
         shape.indexes.get(name)?.definition.clone()
     };
+    let pins: Vec<&Pin> = pins.iter().filter(|p| p.3.hold_for(n)).collect();
     let mut out = Vec::new();
     let names: BTreeSet<&String> = sqlite
         .indexes
@@ -732,10 +815,19 @@ fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
             .unwrap()
             .table;
         let what = format!("{table}.index {name}");
-        let Some(&(_, s_pin, p_pin)) = TRANSLATED.iter().find(|t| t.0 == name) else {
+        let mine: Vec<&&Pin> = pins.iter().filter(|p| p.0 == name).collect();
+        if mine.len() > 1 {
+            out.push(format!(
+                "{what}: {} TRANSLATED entries hold for this version; end the old one \
+                 (`until`) where the new one starts",
+                mine.len()
+            ));
+            continue;
+        }
+        let Some(&&&(_, s_pin, p_pin, _)) = mine.first() else {
             let show = |shape| definition(shape, name).unwrap_or_else(|| "none".into());
             out.push(format!(
-                "{what}: an expression or partial index; add it to TRANSLATED: SQLite {}, \
+                "{what}: an expression or partial index; pin it in TRANSLATED: SQLite {}, \
                  Postgres {}",
                 show(sqlite),
                 show(pg)
@@ -744,8 +836,9 @@ fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
         };
         if let Some(s) = definition(sqlite, name).filter(|s| normalize(s) != normalize(s_pin)) {
             out.push(format!(
-                "{what}: the SQLite definition changed; a migration pair changes both \
-                 sides (docs/database.md), and TRANSLATED with them: {s}"
+                "{what}: the SQLite definition differs from TRANSLATED; a migration pair \
+                 changes both sides (docs/database.md) and pins the new definition from \
+                 its version: {s}"
             ));
         }
         if let Some(p) = definition(pg, name).filter(|p| normalize(p) != normalize(p_pin)) {
@@ -754,16 +847,101 @@ fn untranslated(sqlite: &Shape, pg: &Shape) -> Vec<String> {
             ));
         }
     }
-    for t in TRANSLATED {
-        if definition(sqlite, t.0).is_none() {
+    for p in pins {
+        if definition(sqlite, p.0).is_none() && definition(pg, p.0).is_none() {
             out.push(format!(
-                "TRANSLATED entry {:?} no longer names an expression or partial index of \
-                 init_db; remove it",
-                t.0
+                "TRANSLATED entry {:?} names no expression or partial index; \
+                 start it (`since`) at the version that added the index, or end it \
+                 (`until`) at the one that dropped it",
+                p.0
             ));
         }
     }
     out
+}
+
+/// A version is held to the pins that hold for it: a pin a later version adds
+/// or replaces says nothing about it, while its own pins still apply.
+#[test]
+fn each_version_is_held_to_its_own_pins() {
+    let index = |definition: &str| Idx {
+        table: "t".into(),
+        unique: false,
+        partial: true,
+        keys: None,
+        definition: Some(definition.into()),
+    };
+    let shape = |defs: &[(&str, &str)]| Shape {
+        indexes: defs
+            .iter()
+            .map(|(n, d)| (n.to_string(), index(d)))
+            .collect(),
+        ..Shape::default()
+    };
+    let (x1, x1_pg) = (
+        "CREATE INDEX ix ON t (a) WHERE a > 0",
+        "CREATE INDEX ix ON t USING btree (a) WHERE (a > 0)",
+    );
+    let (x3, x3_pg) = (
+        "CREATE INDEX ix ON t (a) WHERE a > 1",
+        "CREATE INDEX ix ON t USING btree (a) WHERE (a > 1)",
+    );
+    let (y2, y2_pg) = (
+        "CREATE INDEX iy ON t (b) WHERE b > 0",
+        "CREATE INDEX iy ON t USING btree (b) WHERE (b > 0)",
+    );
+    let pins: &[Pin] = &[
+        (
+            "ix",
+            x1,
+            x1_pg,
+            Versions {
+                since: 1,
+                until: Some(3),
+            },
+        ),
+        ("ix", x3, x3_pg, Versions::from(3)),
+        ("iy", y2, y2_pg, Versions::from(2)),
+    ];
+    let versions = [
+        (1, shape(&[("ix", x1)]), shape(&[("ix", x1_pg)])),
+        (
+            2,
+            shape(&[("ix", x1), ("iy", y2)]),
+            shape(&[("ix", x1_pg), ("iy", y2_pg)]),
+        ),
+        (
+            3,
+            shape(&[("ix", x3), ("iy", y2)]),
+            shape(&[("ix", x3_pg), ("iy", y2_pg)]),
+        ),
+    ];
+    for (n, sqlite, pg) in &versions {
+        assert_eq!(
+            untranslated(sqlite, pg, pins, *n),
+            Vec::<String>::new(),
+            "version {n}"
+        );
+    }
+    // The old pin left open when the new one starts: both hold for 3.
+    let overlapping: &[Pin] = &[("ix", x1, x1_pg, Versions::from(1)), pins[1], pins[2]];
+    let (_, v3, v3_pg) = &versions[2];
+    let found = untranslated(v3, v3_pg, overlapping, 3);
+    assert!(
+        found
+            .iter()
+            .any(|e| e.contains("2 TRANSLATED entries hold")),
+        "{found:?}"
+    );
+    let (_, v1, v1_pg) = &versions[0];
+    let found = untranslated(v1, v1_pg, pins, 3);
+    assert!(
+        found
+            .iter()
+            .any(|e| e.contains("index ix: the SQLite definition differs"))
+            && found.iter().any(|e| e.contains("entry \"iy\" names no")),
+        "version 3's pins still hold version 3 to them: {found:?}"
+    );
 }
 
 #[tokio::test]
@@ -784,27 +962,27 @@ async fn every_version_has_the_same_shape_on_both_backends() {
         let postgres = pg_shape(&mut pg.conn).await;
         let diffs = compare(&sqlite, &postgres);
 
+        let allowed: Vec<_> = ALLOWED.iter().filter(|a| a.6.hold_for(n)).collect();
         let mut problems: Vec<String> = diffs
             .iter()
             .filter(|d| {
-                !ALLOWED
+                !allowed
                     .iter()
                     .any(|a| (a.0, a.1, a.2, a.3, a.4) == d.tuple())
             })
             .map(ToString::to_string)
             .collect();
-        // ALLOWED describes today's schema; an older version may differ less.
-        if n == binary_version() {
-            for a in ALLOWED {
-                if !diffs.iter().any(|d| d.tuple() == (a.0, a.1, a.2, a.3, a.4)) {
-                    problems.push(format!(
-                        "ALLOWED entry {:?} no longer matches a difference; remove it",
-                        (a.0, a.1, a.2, a.3, a.4)
-                    ));
-                }
+        for a in allowed {
+            if !diffs.iter().any(|d| d.tuple() == (a.0, a.1, a.2, a.3, a.4)) {
+                problems.push(format!(
+                    "ALLOWED entry {:?} matches no difference; start it (`since`) at the \
+                     version that made the difference, or end it (`until`) at the one that \
+                     removed it",
+                    (a.0, a.1, a.2, a.3, a.4)
+                ));
             }
         }
-        problems.extend(untranslated(&sqlite, &postgres));
+        problems.extend(untranslated(&sqlite, &postgres, TRANSLATED, n));
         problems.extend(uncollated(&mut pg.conn).await);
         assert!(
             problems.is_empty(),
