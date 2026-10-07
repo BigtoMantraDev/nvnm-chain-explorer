@@ -2,6 +2,8 @@
 name = "nvnmchain-explorer"
 version = "0.1.0"
 edition = "2021"
+# sqlx 0.9 requires it.
+rust-version = "1.94"
 description = "nvnmchain blockchain explorer (Rust)"
 license = "MIT"
 
@@ -24,6 +26,10 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# The Postgres backend, without TLS: the database is reached over a private
+# network. Pinned: the writer leans on its connection behaviour
+# (docs/superpowers/specs/2026-10-03-postgres-backend-design.md).
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
 
 # Tempo tx types: RLP-decode the typed 0x76 transaction
 # (https://tempo.xyz/developers/docs/sdk/rust)
@@ -48,7 +54,6 @@ signal-hook = "0.4"
 db-coverage = []
 
 [dev-dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile = "3"
 
 [profile.release]

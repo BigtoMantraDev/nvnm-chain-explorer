@@ -2399,6 +2399,34 @@ pub fn format_time_ago(ts: i64) -> String {
     }
 }
 
+/// `/healthz` and `/readyz`, for an orchestrator's probes. Liveness never
+/// touches the database; readiness reads the status the database layer
+/// publishes and never takes a connection.
+pub fn health(status: watch::Receiver<db::Status>, shutdown: watch::Receiver<bool>) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
+        .with_state(HealthState { status, shutdown })
+}
+
+#[derive(Clone)]
+struct HealthState {
+    status: watch::Receiver<db::Status>,
+    shutdown: watch::Receiver<bool>,
+}
+
+async fn readyz(State(h): State<HealthState>) -> Response {
+    let status = h.status.borrow().clone();
+    // A replica on its way out stops taking new traffic.
+    let ready = status.ready() && !*h.shutdown.borrow();
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(status)).into_response()
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
