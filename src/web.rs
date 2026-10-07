@@ -718,12 +718,16 @@ pub async fn home(
     // A blob written before the head rode along in it (an upgrade, seeded from
     // kv) has no chain_head; the kv row it came from does, so the bar shows
     // real progress rather than 0% until the first recompute.
-    let chain_head = stats
+    let chain_head = match stats
         .get("chain_head")
         .and_then(Value::as_i64)
         .filter(|head| *head > 0)
-        .or_else(|| db::get_kv(&state.db, "chain_head").and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
+    {
+        Some(head) => head,
+        None => db::get_kv(&state.db, "chain_head")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    };
     let index_pct = if chain_head > 0 {
         (indexed_count as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
     } else {
@@ -888,17 +892,21 @@ pub async fn block_page(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let block = if block_id.chars().all(|c| c.is_ascii_digit()) && !block_id.is_empty() {
-        block_id
-            .parse::<i64>()
-            .ok()
-            .and_then(|n| db::get_block_by_number(&state.db, n))
+        match block_id.parse::<i64>() {
+            Ok(n) => db::get_block_by_number(&state.db, n),
+            Err(_) => None,
+        }
     } else {
-        db::get_block_by_hash(&state.db, &block_id).or_else(|| {
-            block_id
+        match db::get_block_by_hash(&state.db, &block_id) {
+            Some(b) => Some(b),
+            None => match block_id
                 .strip_prefix("0x")
                 .and_then(|h| u64::from_str_radix(h, 16).ok())
-                .and_then(|n| db::get_block_by_number(&state.db, n as i64))
-        })
+            {
+                Some(n) => db::get_block_by_number(&state.db, n as i64),
+                None => None,
+            },
+        }
     };
     let Some(block) = block else {
         return not_found(&state, &headers, &query, "Block", &block_id);
@@ -932,10 +940,19 @@ pub async fn block_page(
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
     // Looked up rather than inferred from the tip: the index has gaps while it
     // backfills, so a number below the tip is not necessarily there to link to.
-    let neighbour = |n: i64| db::get_block_by_number(&state.db, n).map(|b| b.number);
-    let previous = (block.number > 0)
-        .then(|| neighbour(block.number - 1))
-        .flatten();
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n);
+    let below = if block.number > 0 {
+        neighbour(block.number - 1)
+    } else {
+        None
+    };
+    let previous = below.as_ref().map(|b| b.number);
+    // The parent hash links by height only to the block it names: after a
+    // reorg or a partial refresh, the row below can hold another block.
+    let parent = below
+        .filter(|b| b.hash.eq_ignore_ascii_case(&block.parent_hash))
+        .map(|b| b.number);
+    let next = neighbour(block.number + 1).map(|b| b.number);
     let ctx = page_ctx(
         &state,
         json!({
@@ -945,7 +962,8 @@ pub async fn block_page(
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
             "previous_block": previous,
-            "next_block": neighbour(block.number + 1),
+            "parent_block": parent,
+            "next_block": next,
         }),
     );
     html_or_json(&state, &headers, &query, "block.html", &ctx)
@@ -1008,7 +1026,10 @@ pub async fn txs_page(
         .unwrap_or_else(|e| e.into_inner())
         .get("total_txns")
         .and_then(Value::as_i64);
-    let total = counted.unwrap_or_else(|| db::get_transaction_count(&state.db));
+    let total = match counted {
+        Some(n) => n,
+        None => db::get_transaction_count(&state.db),
+    };
     let txs: Vec<Value> = db::get_transactions(&state.db, page, PER_PAGE)
         .iter()
         .map(tx_row)
@@ -1275,10 +1296,10 @@ fn gas_and_fee_ctx(
     } else {
         String::new()
     };
-    let fee_token_meta = tx
-        .fee_token
-        .as_deref()
-        .and_then(|f| db::get_token_metadata(&state.db, f));
+    let fee_token_meta = match tx.fee_token.as_deref() {
+        Some(f) => db::get_token_metadata(&state.db, f),
+        None => None,
+    };
     let fee_breakdown = fee_breakdown(tx, gas_used, gas_price, fee_token_meta.as_ref());
     json!({
         "gas_price": gas_price,
@@ -1564,7 +1585,10 @@ pub async fn token_page(
             if fetched.name.is_empty() && fetched.symbol.is_empty() {
                 return not_found(&state, &headers, &query, "Token", &address);
             }
-            let _ = db::save_token_metadata(&state.db, &fetched);
+            // The page renders the fetched descriptor whether or not this lands.
+            if let Err(e) = db::save_token_metadata(&state.db, &fetched) {
+                tracing::warn!("save token metadata {checksummed}: {e:#}");
+            }
             db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
                 // Fall back to a minimal descriptor if the save failed.
                 crate::models::TokenMetadata {
@@ -1820,7 +1844,6 @@ fn destination(kind: &str, id: &str, url: String) -> Value {
 /// apart — and an address is answered whether or not anything has touched it,
 /// since being told "no transactions" beats being told "not found".
 fn resolve_search(db: &Db, q: &str) -> Option<Value> {
-    let block = |number: i64| destination("block", &number.to_string(), format!("/block/{number}"));
     let token = |meta: crate::models::TokenMetadata| {
         destination("token", &meta.address, format!("/token/{}", meta.address))
     };
@@ -1829,24 +1852,40 @@ fn resolve_search(db: &Db, q: &str) -> Option<Value> {
         .then(|| q.parse::<i64>().ok())
         .flatten();
 
-    height
-        .filter(|n| db::get_block_by_number(db, *n).is_some())
-        // Spelled as the reader typed it, leading zeros and all.
-        .map(|_| destination("block", q, format!("/block/{q}")))
-        .or_else(|| {
-            db::get_transaction(db, q).map(|_| destination("transaction", q, format!("/tx/{q}")))
-        })
-        .or_else(|| db::get_block_by_hash(db, q).map(|b| block(b.number)))
-        .or_else(|| {
-            let checksummed = checksum_address(q);
-            is_valid_address(&checksummed)
-                .then(|| destination("address", &checksummed, format!("/address/{checksummed}")))
-        })
-        .or_else(|| db::get_token_metadata(db, q).map(token))
-        // Exact symbol or name first, then the best partial match — so pressing
-        // Enter lands where the suggestions said it would.
-        .or_else(|| db::get_token_by_symbol_or_name(db, q).map(token))
-        .or_else(|| db::search_tokens(db, q, 1).into_iter().next().map(token))
+    if let Some(n) = height {
+        if db::get_block_by_number(db, n).is_some() {
+            // Spelled as the reader typed it, leading zeros and all.
+            return Some(destination("block", q, format!("/block/{q}")));
+        }
+    }
+    if db::get_transaction(db, q).is_some() {
+        return Some(destination("transaction", q, format!("/tx/{q}")));
+    }
+    if let Some(b) = db::get_block_by_hash(db, q) {
+        let number = b.number;
+        return Some(destination(
+            "block",
+            &number.to_string(),
+            format!("/block/{number}"),
+        ));
+    }
+    let checksummed = checksum_address(q);
+    if is_valid_address(&checksummed) {
+        return Some(destination(
+            "address",
+            &checksummed,
+            format!("/address/{checksummed}"),
+        ));
+    }
+    if let Some(meta) = db::get_token_metadata(db, q) {
+        return Some(token(meta));
+    }
+    // Exact symbol or name first, then the best partial match — so pressing
+    // Enter lands where the suggestions said it would.
+    if let Some(meta) = db::get_token_by_symbol_or_name(db, q) {
+        return Some(token(meta));
+    }
+    db::search_tokens(db, q, 1).into_iter().next().map(token)
 }
 
 pub async fn search_page(
@@ -1976,11 +2015,11 @@ pub async fn search_suggest(
     // `parse` from accepting a sign the reader did not mean as a number.
     let number = q.strip_prefix('#').unwrap_or(q);
     if number.chars().all(|c| c.is_ascii_digit()) {
-        if let Some(block) = number
-            .parse::<i64>()
-            .ok()
-            .and_then(|n| db::get_block_by_number(&state.db, n))
-        {
+        let block = match number.parse::<i64>() {
+            Ok(n) => db::get_block_by_number(&state.db, n),
+            Err(_) => None,
+        };
+        if let Some(block) = block {
             results.push(suggestion(
                 "block",
                 format!("/block/{}", block.number),
@@ -2254,17 +2293,11 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
         let ts = args.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
         Ok(Value::String(format_time_ago(ts)))
     });
-    let block_db = db.clone();
-    tera.register_function("get_block_url", move |args: &HashMap<String, Value>| {
+    // A height or a hash; the block page resolves either. Tera functions are
+    // sync, so this one never asks the database.
+    tera.register_function("get_block_url", |args: &HashMap<String, Value>| {
         let id = args.get("block_id").and_then(Value::as_str).unwrap_or("");
-        let url = if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-            format!("/block/{id}")
-        } else {
-            db::get_block_by_hash(&block_db, id)
-                .map(|b| format!("/block/{}", b.number))
-                .unwrap_or_else(|| format!("/block/{id}"))
-        };
-        Ok(Value::String(url))
+        Ok(Value::String(format!("/block/{id}")))
     });
     tera.register_function("get_tx_url", |args: &HashMap<String, Value>| {
         let h = args.get("tx_hash").and_then(Value::as_str).unwrap_or("");

@@ -187,8 +187,13 @@ fn transfer_bundle() -> BlockBundle {
 
 /// A server over the fixture, with `stats` as what the indexer would have left.
 async fn serve(stats: Value) -> (tempfile::TempDir, String) {
-    use nvnmchain_explorer::web::{self, AppState};
+    let (dir, db) = fixture_db();
+    (dir, serve_db(db, stats).await)
+}
 
+/// The pages fixture: blocks 100 and 101, three transactions, one token and
+/// a page's worth of its transfers.
+fn fixture_db() -> (tempfile::TempDir, Db) {
     let (dir, db) = temp_db("pages.db");
     db::save_block(&db, &block()).expect("block");
     db::save_transaction(&db, &transaction(TX_HASH, 1, successful_receipt())).expect("tx");
@@ -214,6 +219,12 @@ async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     // More transfers than fit on a page, so the counts and the pager have
     // something to be wrong about.
     db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
+    (dir, db)
+}
+
+/// Serve `db` on a local port, with no route to the network.
+async fn serve_db(db: Db, stats: Value) -> String {
+    use nvnmchain_explorer::web::{self, AppState};
 
     let mut cfg = Settings::from_env();
     // Nothing here may reach the network. The signature directory is exercised
@@ -239,7 +250,7 @@ async fn serve(stats: Value) -> (tempfile::TempDir, String) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, web::app(state)).await;
     });
-    (dir, format!("http://{addr}"))
+    format!("http://{addr}")
 }
 
 async fn get_json(base: &str, path: &str) -> Value {
@@ -270,6 +281,74 @@ async fn a_block_links_only_to_neighbours_that_are_indexed() {
         .expect("block html");
     assert!(html.contains("href=\"/block/101\""), "a link forward");
     assert!(html.contains("step-off"), "and a dead end back");
+}
+
+/// The parent hash links to the parent's height once that block is indexed, and
+/// to the hash itself before then, which the block page also resolves.
+#[tokio::test]
+async fn the_parent_hash_links_to_the_parent_block() {
+    let (_dir, base) = serve(Value::Null).await;
+    let parent_hash = format!("0x{}", "cd".repeat(32));
+    let block_html = |base: String| async move {
+        reqwest::get(format!("{base}/block/100"))
+            .await
+            .expect("GET /block/100")
+            .text()
+            .await
+            .expect("block html")
+            // Tera escapes `/` in a function's output.
+            .replace("&#x2F;", "/")
+    };
+
+    let html = block_html(base.clone()).await;
+    assert!(
+        html.contains(&format!("href=\"/block/{parent_hash}\"")),
+        "99 is not indexed, so the link is the hash"
+    );
+
+    let (_dir, db) = fixture_db();
+    let parent = Block {
+        number: 99,
+        hash: parent_hash.clone(),
+        ..block()
+    };
+    db::save_block(&db, &parent).expect("block 99");
+    let html = block_html(serve_db(db, Value::Null).await).await;
+    // The "prev" step links to 99 too, so check the parent link itself.
+    assert!(
+        html.contains("href=\"/block/99\" class=\"text-blue-400"),
+        "the parent by height"
+    );
+    assert!(!html.contains(&format!("href=\"/block/{parent_hash}\"")));
+}
+
+/// A block at the parent's height with another hash is not the parent: after a
+/// reorg or a partial refresh, the parent hash still links to the hash, while
+/// the "prev" step still goes to the height below.
+#[tokio::test]
+async fn the_parent_hash_never_links_to_another_block_at_its_height() {
+    let parent_hash = format!("0x{}", "cd".repeat(32));
+    let (_dir, db) = fixture_db();
+    let other = Block {
+        number: 99,
+        hash: format!("0x{}", "98".repeat(32)),
+        ..block()
+    };
+    db::save_block(&db, &other).expect("block 99");
+    let base = serve_db(db, Value::Null).await;
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html")
+        .replace("&#x2F;", "/");
+
+    assert!(
+        html.contains(&format!("href=\"/block/{parent_hash}\"")),
+        "99 holds another block, so the link is the hash"
+    );
+    assert!(html.contains("href=\"/block/99\" class=\"step\""), "prev");
 }
 
 /// Newest first, and only the heights the index holds: the fixture has 100 and

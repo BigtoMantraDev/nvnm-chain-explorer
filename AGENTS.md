@@ -13,6 +13,6 @@ log them with `tracing` or propagate them.
 
 ## Tests
 
-- No network: `cargo test --lib --test decoder --test anchoring --test pages`
+- No network: `cargo test --lib --test decoder --test anchoring --test pages --test shutdown`
 - Against the live chain RPC: `cargo test --test live_rpc`
 - Against Postgres: `docker compose up -d --wait`, then `PG_TEST_URL=postgres://explorer:explorer@localhost:5432/explorer cargo test --test postgres -- --include-ignored`
