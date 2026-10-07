@@ -7,7 +7,7 @@ use rusqlite::params;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::db::{self, Db};
+use crate::db::sqlite::{self as db, Db};
 use crate::models::AnchoringEvent;
 
 /// Bring a database written by an older build back in line with what the read

@@ -517,7 +517,7 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     let Some(bundle) = fetch_block_bundle(rpc, block_num).await? else {
         return Ok(());
     };
-    db::save_block_bundle(db, &bundle)?;
+    db::save_block_bundle(db, &bundle).await?;
     Ok(())
 }
 
@@ -533,6 +533,7 @@ const WINDOW: u64 = 50_000;
 /// stopped run resume at its last window.
 pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
     let done: u64 = db::get_kv(db, BACKFILL_KEY)
+        .await
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let head = rpc.eth_block_number().await.context("head for backfill")?;
@@ -573,11 +574,12 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
         backoff = Duration::from_secs(1);
         // One transaction per window, watermark included, holding the shared
         // connection only to write.
-        wrote += db::save_anchoring_window(db, BACKFILL_KEY, &to.to_string(), |stamp| {
+        wrote += db::save_anchoring_window(db, BACKFILL_KEY, &to.to_string(), move |stamp| {
             logs.iter()
                 .filter_map(|log| anchoring_event_from_log(stamp, log))
                 .collect()
-        })?;
+        })
+        .await?;
         from = to + 1;
         // Leave the node to the indexer between windows.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -610,6 +612,7 @@ fn anchoring_event_from_log(
 /// so a deployed database self-heals without manual intervention.
 async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
     let stale: Vec<String> = db::get_all_token_metas(db)
+        .await
         .into_iter()
         .filter(|m| {
             RESERVED_TOKENS.contains(&m.address.as_str())
@@ -638,7 +641,7 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
             }
             // Written as they arrive: the writes take the lock, so they queue anyway.
             Ok(Ok(meta)) => {
-                if let Err(e) = db::save_token_metadata(db, &meta) {
+                if let Err(e) = db::save_token_metadata(db, &meta).await {
                     warn!(
                         "failed to repair token metadata for {}: {e:#}",
                         meta.address
@@ -786,7 +789,7 @@ fn drain_heads(rx: &mut mpsc::Receiver<u64>, mut head: u64) -> u64 {
 async fn wait_for_seed(db: &Db) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(b) = db::get_latest_block(db) {
+        if let Some(b) = db::get_latest_block(db).await {
             return b.number as u64;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -808,6 +811,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
     ));
 
     let mut sent = db::get_latest_block(&ix.db)
+        .await
         .map(|b| b.number as u64)
         .unwrap_or(0);
     info!("forward loop started from block {sent}");
@@ -819,7 +823,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
         // A fast head feed delivers every block; fold queued heads into one
         // range so we fetch a batch instead of one HTTP request per block.
         let mut head = drain_heads(&mut head_rx, head);
-        db::set_chain_head(&ix.db, head as i64);
+        db::set_chain_head(&ix.db, head as i64).await;
 
         if sent == 0 && head > 0 {
             sent = wait_for_seed(&ix.db).await;
@@ -837,7 +841,7 @@ async fn forward_loop(mut ix: Indexer, block_events: broadcast::Sender<Value>) {
                 return;
             }
             head = drain_heads(&mut head_rx, head);
-            db::set_chain_head(&ix.db, head as i64);
+            db::set_chain_head(&ix.db, head as i64).await;
             let end = sent.saturating_add(ix.cfg.batch).min(head);
             ix.set_tip_lag(head.saturating_sub(sent));
             let bundles = ix.fetch_from(sent + 1, end).await;
@@ -879,7 +883,7 @@ async fn backfill_loop(mut ix: Indexer) {
     // In-memory descending frontier: advancing this without waiting for the
     // writer lets the next fetch overlap the previous commit. Writes are
     // idempotent, so a crash just re-fetches the last in-flight batch.
-    let mut frontier: Option<u64> = db::get_min_block_number(&ix.db).map(|n| n as u64);
+    let mut frontier: Option<u64> = db::get_min_block_number(&ix.db).await.map(|n| n as u64);
     let mut consecutive_failures = 0u32;
     loop {
         if ix.shutting_down() {
@@ -897,7 +901,7 @@ async fn backfill_loop(mut ix: Indexer) {
                 if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
                     break;
                 }
-                frontier = db::get_min_block_number(&ix.db).map(|n| n as u64);
+                frontier = db::get_min_block_number(&ix.db).await.map(|n| n as u64);
                 continue;
             }
             None => match ix.rpc.eth_block_number().await {
@@ -969,7 +973,7 @@ pub async fn run_forever(
 
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
-        db::get_all_token_addresses(&db).into_iter().collect(),
+        db::get_all_token_addresses(&db).await.into_iter().collect(),
     ));
     // Re-fetch token metadata that was stored by the pre-fix ABI string
     // decoder (its name/symbol are NUL-padded control-char garbage). Cheap
@@ -982,7 +986,7 @@ pub async fn run_forever(
         }
     });
     let rebuild_db = db.clone();
-    tokio::spawn(async move { db::repair_derived_tables(&rebuild_db) });
+    tokio::spawn(async move { db::repair_derived_tables(&rebuild_db).await });
     // Anchoring rows for blocks indexed before the table existed.
     let anchoring_rpc = rpc.clone();
     let anchoring_db = db.clone();
@@ -1021,7 +1025,7 @@ pub async fn run_forever(
                 };
                 batch.push(next);
             }
-            if let Err(e) = db::save_block_bundles(&writer_db, &batch) {
+            if let Err(e) = db::save_block_bundles(&writer_db, &batch).await {
                 // One bad bundle failed the whole batch; write the rest on
                 // their own so one block is lost rather than sixty-four.
                 let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
@@ -1029,7 +1033,7 @@ pub async fn run_forever(
                     "db write failed for blocks {first}..={last}: {e:#}; writing them one by one"
                 );
                 for bundle in &batch {
-                    if let Err(e) = db::save_block_bundle(&writer_db, bundle) {
+                    if let Err(e) = db::save_block_bundle(&writer_db, bundle).await {
                         tracing::error!("block {} not written: {e:#}", bundle.block.number);
                     }
                 }
@@ -1081,10 +1085,10 @@ async fn genesis_loop(
 
 /// The transfers indexed since the last pass, a page at a time.
 async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
-    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000)? {
+    while let Some((cursor, holders)) = db::holders_without_genesis_balance(db, 1000).await? {
         let balances = crate::tokens::balances_at_genesis(rpc, &holders).await?;
         let rows: Vec<_> = holders.into_iter().zip(balances).collect();
-        db::save_genesis_balances(db, &rows, cursor)?;
+        db::save_genesis_balances(db, &rows, cursor).await?;
     }
     Ok(())
 }
@@ -1102,7 +1106,7 @@ async fn stats_loop(
         if *shutdown.borrow() {
             break;
         }
-        match db::compute_and_store_stats(&db) {
+        match db::compute_and_store_stats(&db).await {
             Ok(stats) => {
                 *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
                 // Live viewers get the refresh too, tagged the way block

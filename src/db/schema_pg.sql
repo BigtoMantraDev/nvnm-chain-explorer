@@ -1,4 +1,4 @@
--- The Postgres schema: today's end state of `init_db` in src/db.rs.
+-- The Postgres schema: today's end state of `init_db` in src/db/sqlite.rs.
 --
 -- Fork-owned. It holds every table and named index `init_db` creates, and none
 -- of its legacy DROPs, because no older Postgres database exists. Every
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS token_balances (
     PRIMARY KEY (token_addr, holder_addr)
 );
 CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances (holder_addr);
--- The predicate is `HOLDING` in src/db.rs: a partial index only serves queries
+-- The predicate is `HOLDING` in src/db/sqlite.rs: a partial index only serves queries
 -- whose filter it provably implies. `TRANSLATED` in tests/postgres.rs pins this
 -- definition and `init_db`'s, so a change to either fails until ported.
 CREATE INDEX IF NOT EXISTS idx_tb_holding

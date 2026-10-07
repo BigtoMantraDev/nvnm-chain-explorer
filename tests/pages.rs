@@ -24,11 +24,9 @@ const FAILED_TX_HASH: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const UNKNOWN_LOG_TX_HASH: &str =
     "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join(name);
-    (dir, db::open(path.to_str().unwrap()).expect("init_db"))
-}
+#[path = "common/backend.rs"]
+mod backend;
+use backend::temp_db;
 
 fn topic(address: &str) -> String {
     format!("0x{}{}", "00".repeat(12), address.trim_start_matches("0x"))
@@ -186,23 +184,27 @@ fn transfer_bundle() -> BlockBundle {
 }
 
 /// A server over the fixture, with `stats` as what the indexer would have left.
-async fn serve(stats: Value) -> (tempfile::TempDir, String) {
-    let (dir, db) = fixture_db();
+async fn serve(stats: Value) -> (backend::TempDb, String) {
+    let (dir, db) = fixture_db().await;
     (dir, serve_db(db, stats).await)
 }
 
 /// The pages fixture: blocks 100 and 101, three transactions, one token and
 /// a page's worth of its transfers.
-fn fixture_db() -> (tempfile::TempDir, Db) {
-    let (dir, db) = temp_db("pages.db");
-    db::save_block(&db, &block()).expect("block");
-    db::save_transaction(&db, &transaction(TX_HASH, 1, successful_receipt())).expect("tx");
+async fn fixture_db() -> (backend::TempDb, Db) {
+    let (dir, db) = temp_db("pages.db").await;
+    db::save_block(&db, &block()).await.expect("block");
+    db::save_transaction(&db, &transaction(TX_HASH, 1, successful_receipt()))
+        .await
+        .expect("tx");
     db::save_transaction(&db, &transaction(FAILED_TX_HASH, 0, failed_receipt()))
+        .await
         .expect("failed tx");
     db::save_transaction(
         &db,
         &transaction(UNKNOWN_LOG_TX_HASH, 1, unknown_log_receipt()),
     )
+    .await
     .expect("unknown-log tx");
     db::save_token_metadata(
         &db,
@@ -215,10 +217,13 @@ fn fixture_db() -> (tempfile::TempDir, Db) {
             total_supply: "1000000000".into(),
         },
     )
+    .await
     .expect("token");
     // More transfers than fit on a page, so the counts and the pager have
     // something to be wrong about.
-    db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
+    db::save_block_bundle(&db, &transfer_bundle())
+        .await
+        .expect("transfers");
     (dir, db)
 }
 
@@ -306,13 +311,13 @@ async fn the_parent_hash_links_to_the_parent_block() {
         "99 is not indexed, so the link is the hash"
     );
 
-    let (_dir, db) = fixture_db();
+    let (_dir, db) = fixture_db().await;
     let parent = Block {
         number: 99,
         hash: parent_hash.clone(),
         ..block()
     };
-    db::save_block(&db, &parent).expect("block 99");
+    db::save_block(&db, &parent).await.expect("block 99");
     let html = block_html(serve_db(db, Value::Null).await).await;
     // The "prev" step links to 99 too, so check the parent link itself.
     assert!(
@@ -328,13 +333,13 @@ async fn the_parent_hash_links_to_the_parent_block() {
 #[tokio::test]
 async fn the_parent_hash_never_links_to_another_block_at_its_height() {
     let parent_hash = format!("0x{}", "cd".repeat(32));
-    let (_dir, db) = fixture_db();
+    let (_dir, db) = fixture_db().await;
     let other = Block {
         number: 99,
         hash: format!("0x{}", "98".repeat(32)),
         ..block()
     };
-    db::save_block(&db, &other).expect("block 99");
+    db::save_block(&db, &other).await.expect("block 99");
     let base = serve_db(db, Value::Null).await;
     let html = reqwest::get(format!("{base}/block/100"))
         .await
@@ -670,9 +675,9 @@ async fn an_address_counts_every_transfer_not_just_the_page() {
 
 /// The address page merges what an address sent with what it received, newest
 /// first, and a page boundary neither repeats nor skips a transaction.
-#[test]
-fn an_address_page_merges_sent_and_received_in_block_order() {
-    let (_dir, db) = temp_db("address-order.db");
+#[tokio::test]
+async fn an_address_page_merges_sent_and_received_in_block_order() {
+    let (_dir, db) = temp_db("address-order.db").await;
     let me = checksum_address(RECIPIENT);
     let other = checksum_address(TOKEN);
     // Two blocks, each with: one sent, one received, one to itself, one not its.
@@ -701,17 +706,18 @@ fn an_address_page_merges_sent_and_received_in_block_order() {
             anchoring: Vec::new(),
             tokens: Vec::new(),
         };
-        db::save_block_bundle(&db, &bundle).expect("save");
+        db::save_block_bundle(&db, &bundle).await.expect("save");
     }
 
-    let pages: Vec<Vec<(i64, i64)>> = (1..=4)
-        .map(|page| {
-            db::get_address_transactions(&db, &me, page, 2, TxColumns::List)
-                .iter()
+    let mut pages: Vec<Vec<(i64, i64)>> = Vec::new();
+    for page in 1..=4 {
+        let rows = db::get_address_transactions(&db, &me, page, 2, TxColumns::List).await;
+        pages.push(
+            rows.iter()
                 .map(|tx| (tx.block_number, tx.position))
-                .collect()
-        })
-        .collect();
+                .collect(),
+        );
+    }
     assert_eq!(
         pages,
         [
@@ -721,13 +727,13 @@ fn an_address_page_merges_sent_and_received_in_block_order() {
             vec![],
         ]
     );
-    assert_eq!(db::get_address_transaction_count(&db, &me), 6);
+    assert_eq!(db::get_address_transaction_count(&db, &me).await, 6);
 }
 
 /// The transfers tab merges the two sides the same way.
-#[test]
-fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
-    let (_dir, db) = temp_db("transfer-order.db");
+#[tokio::test]
+async fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
+    let (_dir, db) = temp_db("transfer-order.db").await;
     let me = checksum_address(RECIPIENT);
     let other = checksum_address(SENDER);
     for (block_number, byte) in [(100, "a1"), (101, "b2")] {
@@ -758,22 +764,23 @@ fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
             anchoring: Vec::new(),
             tokens: Vec::new(),
         };
-        db::save_block_bundle(&db, &bundle).expect("save");
+        db::save_block_bundle(&db, &bundle).await.expect("save");
     }
 
-    let pages: Vec<Vec<(i64, i64)>> = (1..=4)
-        .map(|page| {
-            db::get_address_transfers(&db, &me, page, 2)
-                .iter()
+    let mut pages: Vec<Vec<(i64, i64)>> = Vec::new();
+    for page in 1..=4 {
+        let rows = db::get_address_transfers(&db, &me, page, 2).await;
+        pages.push(
+            rows.iter()
                 .map(|row| {
                     (
                         row["block_number"].as_i64().unwrap(),
                         row["log_index"].as_i64().unwrap(),
                     )
                 })
-                .collect()
-        })
-        .collect();
+                .collect(),
+        );
+    }
     assert_eq!(
         pages,
         [
@@ -783,7 +790,7 @@ fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
             vec![],
         ]
     );
-    assert_eq!(db::get_address_transfer_count(&db, &me), 6);
+    assert_eq!(db::get_address_transfer_count(&db, &me).await, 6);
 }
 
 #[tokio::test]
@@ -812,37 +819,59 @@ async fn a_token_lists_its_holders() {
 
 /// A holder genesis funded spends what no transfer gave it: its balance at
 /// block 0 makes it a holder, once, and again after a rebuild.
-#[test]
-fn a_genesis_balance_counts_once() {
-    let (_dir, db) = temp_db("genesis.db");
+#[tokio::test]
+async fn a_genesis_balance_counts_once() {
+    let (_dir, db) = temp_db("genesis.db").await;
     let token = checksum_address(TOKEN);
     let sender = checksum_address(SENDER);
     let held = |db: &Db| {
-        db::get_token_holders(db, &token, 1, 100)
-            .into_iter()
-            .find(|(holder, _)| *holder == sender)
-            .map(|(_, balance)| balance)
+        let (db, token, sender) = (db.clone(), token.clone(), sender.clone());
+        async move {
+            db::get_token_holders(&db, &token, 1, 100)
+                .await
+                .into_iter()
+                .find(|(holder, _)| *holder == sender)
+                .map(|(_, balance)| balance)
+        }
     };
-    db::save_block_bundle(&db, &transfer_bundle()).expect("save");
-    assert_eq!(held(&db), None, "negative until its genesis balance is in");
+    db::save_block_bundle(&db, &transfer_bundle())
+        .await
+        .expect("save");
+    assert_eq!(
+        held(&db).await,
+        None,
+        "negative until its genesis balance is in"
+    );
 
     let (cursor, holders) = db::holders_without_genesis_balance(&db, 1000)
+        .await
         .expect("holders")
         .expect("new transfers");
     assert!(holders.contains(&(token.clone(), sender.clone())));
     let genesis = [((token.clone(), sender.clone()), "100000000".to_string())];
-    db::save_genesis_balances(&db, &genesis, cursor).expect("save");
-    db::save_genesis_balances(&db, &genesis, cursor).expect("save again");
+    db::save_genesis_balances(&db, &genesis, cursor)
+        .await
+        .expect("save");
+    db::save_genesis_balances(&db, &genesis, cursor)
+        .await
+        .expect("save again");
     assert!(db::holders_without_genesis_balance(&db, 1000)
+        .await
         .expect("holders")
         .is_none());
 
     // 100 at genesis, less the 30 sent.
-    assert_eq!(held(&db).as_deref(), Some("70000000"));
-    assert_eq!(db::get_token_holder_count(&db, &token), TRANSFER_COUNT + 1);
+    assert_eq!(held(&db).await.as_deref(), Some("70000000"));
+    assert_eq!(
+        db::get_token_holder_count(&db, &token).await,
+        TRANSFER_COUNT + 1
+    );
     db::rebuild_token_balances(&db::lock(&db)).expect("rebuild");
-    assert_eq!(held(&db).as_deref(), Some("70000000"));
-    assert_eq!(db::get_token_holder_count(&db, &token), TRANSFER_COUNT + 1);
+    assert_eq!(held(&db).await.as_deref(), Some("70000000"));
+    assert_eq!(
+        db::get_token_holder_count(&db, &token).await,
+        TRANSFER_COUNT + 1
+    );
 }
 
 /// Addresses are copied all day; every page that shows one must offer it.
@@ -875,7 +904,7 @@ async fn addresses_are_copyable_and_labelled() {
 async fn precompiles_are_labelled_without_a_database_row() {
     use nvnmchain_explorer::web::address_label;
 
-    let (_dir, db) = temp_db("labels.db");
+    let (_dir, db) = temp_db("labels.db").await;
     assert_eq!(
         address_label(&db, "0xfeEC000000000000000000000000000000000000").as_deref(),
         Some("Fee Manager")
@@ -1030,7 +1059,7 @@ async fn an_unknown_selector_is_named_by_the_directory() {
     }))
     .await;
 
-    let (_dir, db) = temp_db("signatures.db");
+    let (_dir, db) = temp_db("signatures.db").await;
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = Some(url);
     let client = reqwest::Client::new();
@@ -1072,7 +1101,7 @@ async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
     }))
     .await;
 
-    let (_dir, db) = temp_db("bad-signatures.db");
+    let (_dir, db) = temp_db("bad-signatures.db").await;
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = Some(url);
     let client = reqwest::Client::new();
@@ -1094,7 +1123,7 @@ async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
 /// With no directory configured, nothing is asked and nothing breaks.
 #[tokio::test]
 async fn the_directory_can_be_turned_off() {
-    let (_dir, db) = temp_db("no-directory.db");
+    let (_dir, db) = temp_db("no-directory.db").await;
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     let names = signatures::resolve(
@@ -1193,7 +1222,7 @@ async fn canonical_contracts_are_named_and_searchable() {
     let multicall = "0xcA11bde05977b3631167028862bE2a173976CA11";
     let anchoring = "0x0000000000000000000000000000000000000a00";
 
-    let (dir, db) = temp_db("canonical.db");
+    let (dir, db) = temp_db("canonical.db").await;
     assert_eq!(
         nvnmchain_explorer::web::address_label(&db, multicall).as_deref(),
         Some("Multicall3")
@@ -1221,4 +1250,91 @@ async fn canonical_contracts_are_named_and_searchable() {
         .expect("writes")
         .iter()
         .any(|f| f["name"] == json!("aggregate3")));
+}
+
+fn labelled_token(address: &str, symbol: &str, name: &str) -> TokenMeta {
+    TokenMeta {
+        address: checksum_address(address),
+        name: name.into(),
+        symbol: symbol.into(),
+        decimals: 6,
+        currency: "USD".into(),
+        total_supply: "1".into(),
+    }
+}
+
+fn bundle_with_tokens(number: i64, tokens: Vec<TokenMeta>) -> BlockBundle {
+    BlockBundle {
+        block: Block {
+            number,
+            hash: format!("0x{number:064x}"),
+            tx_count: 0,
+            ..block()
+        },
+        txs: Vec::new(),
+        transfers: Vec::new(),
+        anchoring: Vec::new(),
+        tokens,
+    }
+}
+
+/// Tera functions are sync, so a token's label comes from the label cache, and
+/// every way a token reaches the database must reach the cache too: a page
+/// view's save, a block, and a batch of blocks. A token with neither symbol nor
+/// name falls through to the later rules rather than showing an empty tag.
+#[tokio::test]
+async fn token_labels_follow_every_write_path() {
+    let (_dir, db) = temp_db("labels.db").await;
+    let tera = nvnmchain_explorer::web::build_tera(db.clone()).expect("templates");
+    let saved = "0x5555555555555555555555555555555555555501";
+    let in_block = "0x5555555555555555555555555555555555555502";
+    let in_batch = "0x5555555555555555555555555555555555555503";
+    let by_name = "0x5555555555555555555555555555555555555504";
+    let nameless = "0x20C0000000000000000000000000000000000077";
+
+    db::save_token_metadata(&db, &labelled_token(saved, "ONE", "One"))
+        .await
+        .expect("save");
+    db::save_block_bundle(
+        &db,
+        &bundle_with_tokens(
+            100,
+            vec![
+                labelled_token(in_block, "TWO", "Two"),
+                labelled_token(by_name, "", "Named"),
+                labelled_token(nameless, "", ""),
+            ],
+        ),
+    )
+    .await
+    .expect("block");
+    db::save_block_bundles(
+        &db,
+        &[bundle_with_tokens(
+            101,
+            vec![labelled_token(in_batch, "THREE", "Three")],
+        )],
+    )
+    .await
+    .expect("batch");
+
+    let label = |address: &str| {
+        let mut tera = (*tera).clone();
+        let mut ctx = tera::Context::new();
+        ctx.insert("a", address);
+        tera.render_str(
+            "{% set l = address_label(address=a) %}{% if l %}[{{ l }}]{% endif %}",
+            &ctx,
+        )
+        .expect("render")
+    };
+    assert_eq!(label(saved), "[ONE]", "a page view's save");
+    assert_eq!(label(in_block), "[TWO]", "a block");
+    assert_eq!(label(in_batch), "[THREE]", "a batch");
+    assert_eq!(
+        label(by_name),
+        "[Named]",
+        "the name when there is no symbol"
+    );
+    assert_eq!(label(nameless), "[TIP-20]", "no empty tag");
 }
