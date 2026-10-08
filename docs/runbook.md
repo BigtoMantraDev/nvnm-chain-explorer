@@ -74,9 +74,14 @@ After the switch, every release rolls `explorer-indexer` first, then
 ## Preflight refusals
 
 The indexer checks these before it asks for the lock, and exits 1 (never
-Ready, so a broken image never replaces a working writer):
+Ready, so a broken image never replaces a working writer). It checks them
+again once it holds the lock, since a newer release may have migrated while
+it waited, and exits 1 the same way:
 
 - **"no schema_migrations"**: the schema was created by hand. Drop it and
+  re-index.
+- **"has version N but not M"**: rows of `schema_migrations` were deleted or
+  written by hand, so which files ran is unknown. Drop the schema and
   re-index.
 - **"migration N was edited after it was applied"**: the image carries a
   changed migration file. Deploy an image whose files match; merged migrations

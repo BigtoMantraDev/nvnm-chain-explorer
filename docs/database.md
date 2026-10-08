@@ -19,7 +19,9 @@ Both backends share one list of schema versions, `migrations!{}` in
 - **D** is a database's version (its highest `schema_migrations.version`),
   **B** this binary's (the last entry in the list). A process applies
   versions D+1..B; a database newer than the binary (D > B) is refused, and
-  the only way back is forward.
+  the only way back is forward. So is one whose versions skip a number below
+  D, on either backend: the runners record versions in order, so only hand
+  edits leave a gap.
 - **Merged files never change.** A running process refuses a database whose
   recorded checksum differs ("migration N was edited after it was applied"),
   and CI fails a pull request that modifies, deletes or renames anything under
