@@ -52,11 +52,12 @@ jobs:
 
       # The tests are #[ignore]d so plain `cargo test` needs no server; here
       # they must run, and fail rather than skip if PG_TEST_URL is missing.
-      - name: Migrations, locks and outages
+      - name: Replay, differential, migrations, locks and outages
         if: matrix.suite == 'postgres-suites'
         run: |
           cargo test --lib -- --include-ignored
           cargo test \
-            --test postgres --test migrations --test locks --test outage_drills \
+            --test postgres --test migrations --test replay --test differential \
+            --test locks --test outage_drills \
             -- --include-ignored
 

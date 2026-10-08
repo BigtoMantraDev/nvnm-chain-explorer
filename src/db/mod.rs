@@ -352,25 +352,47 @@ pub async fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> 
     #[cfg(feature = "db-coverage")]
     coverage::hit("save_block_bundles");
     match &db.0.backend {
-        Backend::Sqlite(s) => sqlite::save_block_bundles(s, bundles)?,
-        Backend::Postgres(p) => pg::save_block_bundles(p, bundles).await?,
+        Backend::Sqlite(s) => {
+            sqlite::save_block_bundles(s, bundles)?;
+            db.0.labels.committed(bundles);
+            Ok(())
+        }
+        Backend::Postgres(_) => save_and_label(db, bundles.to_vec()).await,
     }
-    db.0.labels.committed(bundles);
-    Ok(())
 }
 
 /// Persist one indexed block atomically.
 pub async fn save_block_bundle(db: &Db, bundle: &BlockBundle) -> Result<()> {
     #[cfg(feature = "db-coverage")]
     coverage::hit("save_block_bundle");
-    let one = std::slice::from_ref(bundle);
     match &db.0.backend {
-        Backend::Sqlite(s) => sqlite::save_block_bundle(s, bundle)?,
+        Backend::Sqlite(s) => {
+            sqlite::save_block_bundle(s, bundle)?;
+            db.0.labels.committed(std::slice::from_ref(bundle));
+            Ok(())
+        }
         // No singular twin: one bundle is a batch of one.
-        Backend::Postgres(p) => pg::save_block_bundles(p, one).await?,
+        Backend::Postgres(_) => save_and_label(db, vec![bundle.clone()]).await,
     }
-    db.0.labels.committed(one);
-    Ok(())
+}
+
+/// The bundle saves on Postgres. A batch commits on in the writer's spawned
+/// task when its caller is dropped, so the label update runs in a task of its
+/// own that waits for the commit, as `save_token_metadata`'s does.
+async fn save_and_label(db: &Db, bundles: Vec<BlockBundle>) -> Result<()> {
+    let db = db.clone();
+    let task = tokio::spawn(async move {
+        let Backend::Postgres(p) = &db.0.backend else {
+            unreachable!()
+        };
+        pg::save_block_bundles(p, &bundles).await?;
+        db.0.labels.committed(&bundles);
+        anyhow::Ok(())
+    });
+    match task.await {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
 }
 
 pub async fn save_token_metadata(db: &Db, meta: &TokenMeta) -> Result<()> {

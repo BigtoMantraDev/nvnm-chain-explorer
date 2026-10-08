@@ -31,13 +31,13 @@ use rusqlite::{Connection, OpenFlags};
 use sqlx::postgres::{PgArguments, PgConnection, Postgres};
 use sqlx::query::Query;
 use sqlx::{
-    AssertSqlSafe, Column as _, Connection as _, Either, Executor as _, Row as _, SqlSafeStr as _,
+    AssertSqlSafe, Connection as _, Either, Executor as _, Row as _, SqlSafeStr as _,
     Statement as _, TypeInfo as _,
 };
 
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, row_key, rows, tables, to_json, Rows, Spec, SPECS};
+use common::baseline::{columns, diff_rows, pg_rows, row_key, rows, tables, to_json, Spec, SPECS};
 
 use nvnmchain_explorer::db::migrations::{
     binary_version, check_pair, headers, split_at_line_end, Migration, MIGRATIONS,
@@ -1148,36 +1148,6 @@ async fn copy_table(
         .await
         .unwrap_or_else(|e| panic!("{table}: commit: {}", pg_error(&e)));
     source.len()
-}
-
-/// A table's rows read back, converted with the same rules as the fixture's.
-async fn pg_rows(conn: &mut PgConnection, spec: &Spec, cols: &[String]) -> Rows {
-    let found = sqlx::query(AssertSqlSafe(format!(
-        "SELECT {} FROM {}",
-        quoted(cols),
-        spec.table
-    )))
-    .fetch_all(conn)
-    .await
-    .unwrap_or_else(|e| panic!("{}: read back: {}", spec.table, pg_error(&e)));
-    let mut out = Rows::new();
-    for row in &found {
-        let mut fields = BTreeMap::new();
-        for (i, col) in cols.iter().enumerate() {
-            let value = match row.columns()[i].type_info().name() {
-                "INT8" => row.get::<Option<i64>, _>(i).map_or(Sql::Null, Sql::Integer),
-                "TEXT" => row.get::<Option<String>, _>(i).map_or(Sql::Null, Sql::Text),
-                "BYTEA" => row
-                    .get::<Option<Vec<u8>>, _>(i)
-                    .map_or(Sql::Null, Sql::Blob),
-                ty => panic!("{}.{col}: unexpected type {ty}", spec.table),
-            };
-            fields.insert(col.clone(), to_json(col, value));
-        }
-        out.insert(row_key(spec, &fields), fields);
-    }
-    assert_eq!(out.len(), found.len(), "{}: duplicate row keys", spec.table);
-    out
 }
 
 #[tokio::test]

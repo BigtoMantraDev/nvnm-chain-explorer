@@ -19,7 +19,9 @@ use super::{migrations, DbConfig, Role, Status};
 
 mod blocks;
 mod error;
+mod jobs;
 pub(crate) mod migrate;
+pub(crate) mod plan;
 pub(crate) mod q;
 pub(crate) mod shared;
 mod tokens;
@@ -30,6 +32,7 @@ pub(crate) mod writer;
 
 pub(crate) use blocks::*;
 pub use error::DbError;
+pub(crate) use jobs::*;
 pub(crate) use tokens::*;
 pub(crate) use transfers::*;
 pub(crate) use txs::*;
@@ -195,39 +198,8 @@ pub(crate) async fn schema_version(read: &PgPool) -> Result<i64> {
     Ok(row.unwrap_or(0))
 }
 
-// Not on Postgres yet: the batch writer and the indexer's jobs land before
-// Postgres becomes selectable.
-
-pub(crate) async fn save_block_bundles(_: &PgDb, _: &[crate::models::BlockBundle]) -> Result<()> {
-    anyhow::bail!("save_block_bundles: not implemented on Postgres yet")
-}
-
-pub(crate) async fn save_anchoring_window(
-    _: &PgDb,
-    _: &str,
-    _: &str,
-    _: impl Fn(&dyn Fn(i64) -> Option<i64>) -> Vec<crate::models::AnchoringEvent> + Send + 'static,
-) -> Result<usize> {
-    anyhow::bail!("save_anchoring_window: not implemented on Postgres yet")
-}
-
-pub(crate) async fn save_genesis_balances(
-    _: &PgDb,
-    _: &[(crate::db::Holder, String)],
-    _: i64,
-) -> Result<()> {
-    anyhow::bail!("save_genesis_balances: not implemented on Postgres yet")
-}
-
-pub(crate) async fn holders_without_genesis_balance(
-    _: &PgDb,
-    _: i64,
-) -> Result<Option<(i64, Vec<crate::db::Holder>)>> {
-    anyhow::bail!("holders_without_genesis_balance: not implemented on Postgres yet")
-}
-
-pub(crate) async fn repair_derived_tables(_: &PgDb) {}
-
+/// Not on Postgres yet: the home-page stats land with the rest of the
+/// indexer's jobs, before Postgres becomes selectable.
 pub(crate) async fn compute_and_store_stats(_: &PgDb) -> Result<serde_json::Value> {
     anyhow::bail!("compute_and_store_stats: not implemented on Postgres yet")
 }

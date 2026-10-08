@@ -22,6 +22,10 @@ pub(crate) fn blob_addr(bytes: &[u8]) -> String {
     crate::decoder::checksum_address(&blob_hex(bytes))
 }
 
+pub(crate) fn bigint(s: &str) -> num_bigint::BigInt {
+    num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).unwrap_or_else(|| num_bigint::BigInt::from(0))
+}
+
 /// Postgres `TEXT` refuses a NUL byte, which SQLite stores. Caches drop it.
 pub(crate) fn without_nul(s: &str) -> String {
     s.replace('\0', "")
