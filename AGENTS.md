@@ -20,5 +20,6 @@ log them with `tracing` or propagate them.
   - the usual suites on Postgres: `TEST_DB=postgres cargo test --test decoder --test anchoring --test pages -- --skip duplicate_bundle_is_idempotent --skip anchoring_events_read_back_by_registry`
   - the Postgres suites: `cargo test --lib -- --include-ignored` and `cargo test --features db-coverage --test postgres --test migrations --test replay --test differential --test grid --test locks --test indexer_pg --test outage_drills -- --include-ignored`
   - the live re-index into Postgres: `TEST_DB=postgres cargo test --test baseline`
+  - the restart drill, which restarts the container, so run it alone: `PG_CONTAINER=nvnmchain-explorer-postgres-1 cargo test --test restart_drill -- --include-ignored`
 
 `docs/database.md` has the details, and how to add a schema change.

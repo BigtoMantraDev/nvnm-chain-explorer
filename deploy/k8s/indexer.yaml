@@ -1,0 +1,59 @@
+# The one writer: indexes the chain into Postgres and runs its migrations.
+#
+# replicas: 1, and a rollout that starts the new pod before stopping the old:
+# the new pod turns Ready once its preflight passes and waits as a candidate
+# for the writer's lock; only then is the old pod terminated, which frees it.
+# Readiness never waits on the lock, or every release carrying a migration
+# would deadlock. Roll this deployment first on every release (README.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: explorer-indexer
+  labels: {app: explorer, role: indexer}
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: explorer, role: indexer}
+  template:
+    metadata:
+      labels: {app: explorer, role: indexer}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: explorer
+          image: ghcr.io/nvnm-chain/nvnmchain-explorer:latest # pin a sha-<commit> tag
+          env:
+            - {name: ROLE, value: indexer}
+            # No credentials in the URL. Cloud SQL: the instance's PSA DNS name;
+            # CloudNativePG: the primary's read-write Service, <cluster>-rw.
+            - name: DATABASE_URL
+              value: postgres://explorer-db.internal:5432/explorer
+            - {name: PGUSER, value: explorer_indexer}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: explorer-indexer-db, key: password}
+            - {name: DB_WEB_ROLE, value: explorer_web}
+            - {name: NVNM_RPC, value: "https://rpc.example.internal"}
+            - {name: WS_URL, value: "wss://ws.example.internal"}
+            - {name: PORT, value: "8080"}
+          ports:
+            - {name: http, containerPort: 8080}
+          # Liveness never checks the database, so an outage restarts nothing.
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          # Ready once the preflight passed: candidate, leader or re-acquiring.
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {memory: 2Gi}
