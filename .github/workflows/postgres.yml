@@ -1,5 +1,8 @@
-# Fork-owned: ci.yml is upstream's, and a job appended there would conflict
-# with upstream's next change to it. See docs/database.md.
+# The Postgres backend's suites. ci.yml runs everything that needs no server.
+#
+# Postgres is a service container. `command` starts it with
+# `-c max_connections=300`, as docker-compose.yml does: every test opens small
+# pools of its own.
 name: Postgres
 
 on:
@@ -10,14 +13,16 @@ on:
 
 env:
   RUSTFLAGS: "-D warnings"
+  PG_TEST_URL: postgres://explorer:explorer@localhost:5432/explorer
 
 jobs:
   postgres:
-    name: Test (Postgres)
+    name: ${{ matrix.suite }}
     runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:18.6 # same tag as docker-compose.yml
+        command: postgres -c max_connections=300
         env:
           POSTGRES_USER: explorer
           POSTGRES_PASSWORD: explorer
@@ -27,8 +32,12 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U explorer -d explorer"
           --health-interval 2s --health-timeout 3s --health-retries 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [postgres-suites]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -43,7 +52,11 @@ jobs:
 
       # The tests are #[ignore]d so plain `cargo test` needs no server; here
       # they must run, and fail rather than skip if PG_TEST_URL is missing.
-      - name: Schema parity and baseline round-trip
-        run: cargo test --test postgres -- --include-ignored
-        env:
-          PG_TEST_URL: postgres://explorer:explorer@localhost:5432/explorer
+      - name: Migrations, locks and outages
+        if: matrix.suite == 'postgres-suites'
+        run: |
+          cargo test --lib -- --include-ignored
+          cargo test \
+            --test postgres --test migrations --test locks --test outage_drills \
+            -- --include-ignored
+

@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 #[cfg(test)]
 use sha3::{Digest, Sha3_256};
 
-use crate::db::migrations::{binary_version, checksum, MIGRATIONS};
+use crate::db::migrations::{binary_version, checksum, first_gap, MIGRATIONS};
 
 /// The shape of `init_db(":memory:")`: what version 1 is on SQLite.
 pub(crate) const BASELINE_SHA3: &str =
@@ -64,6 +64,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    if let Some((missing, found)) = first_gap(applied.iter().map(|(v, _)| *v)) {
+        bail!(
+            "schema_migrations has version {found} but not {missing}: its rows were edited by \
+             hand, so which files ran is unknown"
+        );
+    }
     let binary = binary_version();
     let db = applied.last().map_or(0, |(v, _)| *v);
     if db > binary {
@@ -237,6 +243,27 @@ mod tests {
                 .unwrap();
             assert_eq!(kept, "{}");
         }
+    }
+
+    #[test]
+    fn a_gap_in_the_versions_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gap.db");
+        drop(sqlite::open(path.to_str().unwrap()).unwrap());
+        let (missing, found) = (binary_version() + 1, binary_version() + 2);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO schema_migrations VALUES (?1, 'later', 'x', 0, 'test')",
+                [found],
+            )
+            .unwrap();
+
+        let err = format!("{:#}", sqlite::open(path.to_str().unwrap()).err().unwrap());
+        assert!(
+            err.contains(&format!("has version {found} but not {missing}")),
+            "{err}"
+        );
     }
 
     #[test]

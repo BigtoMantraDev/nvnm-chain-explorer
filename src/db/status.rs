@@ -12,6 +12,27 @@ use super::Role;
 pub struct Status {
     pub role: Role,
     pub schema: SchemaVersions,
+    /// The writer's state, where this process has one on Postgres.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writer: Option<WriterState>,
+    /// Whether the indexer's lock-free preflight has passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<Preflight>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WriterState {
+    Candidate,
+    Leader,
+    Reacquiring,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Preflight {
+    Pending,
+    Passed,
 }
 
 /// D, the database's version (unknown until it has been read), and B, this
@@ -31,12 +52,19 @@ impl Status {
                 db: None,
                 binary: migrations::binary_version(),
             },
+            writer: None,
+            preflight: (role == Role::Indexer).then_some(Preflight::Pending),
         }
     }
 
     /// Whether this process should get traffic. Database health never
     /// counts: a failed read is answered where it happens.
     pub fn ready(&self) -> bool {
-        self.schema.db.is_some_and(migrations::web_ready)
+        match self.role {
+            // Whether a candidate, the leader or re-acquiring: a new pod must
+            // turn Ready while it waits for the lock, or a rollout deadlocks.
+            Role::Indexer => self.preflight == Some(Preflight::Passed),
+            Role::All | Role::Web => self.schema.db.is_some_and(migrations::web_ready),
+        }
     }
 }
