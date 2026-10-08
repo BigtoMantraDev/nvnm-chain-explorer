@@ -7,7 +7,9 @@
 use std::time::Duration;
 
 use nvnmchain_explorer::db::{self, Db, DbConfig, DbError, Role, Status, WriterState};
+use nvnmchain_explorer::decoder::checksum_address;
 use nvnmchain_explorer::models::{Block, BlockBundle};
+use nvnmchain_explorer::tokens::TokenMeta;
 use sqlx::{AssertSqlSafe, Connection as _, PgConnection, Row as _};
 use tokio::sync::watch;
 
@@ -248,6 +250,43 @@ async fn a_dropped_caller_does_not_abort_its_batch() {
         "the batch committed"
     );
     assert_eq!(db::testing::writer_pid(&db), Some(pid), "the same session");
+}
+
+/// A dropped caller's batch still labels its tokens: the label cache is
+/// updated by the task that waits for the commit, not by the caller.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_dropped_callers_batch_still_labels_its_tokens() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    let (db, _status) = open(&fast(&url, Role::Indexer)).await;
+    exec(
+        &url,
+        "CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.05); RETURN NEW; END $$;
+         CREATE TRIGGER slow BEFORE INSERT ON blocks FOR EACH ROW EXECUTE FUNCTION slow();",
+    )
+    .await;
+    let token = checksum_address(&format!("0x{}", "ab".repeat(20)));
+    let mut batch: Vec<BlockBundle> = (10..40).map(bundle).collect();
+    batch[0].tokens.push(TokenMeta {
+        address: token.clone(),
+        name: "Label Coin".into(),
+        symbol: "LBL".into(),
+        decimals: 6,
+        currency: "USD".into(),
+        total_supply: "0".into(),
+    });
+    let call = db::save_block_bundles(&db, &batch);
+    assert!(tokio::time::timeout(Duration::from_millis(200), call)
+        .await
+        .is_err());
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        count(&url, "SELECT COUNT(*) FROM blocks").await,
+        30,
+        "the batch committed"
+    );
+    assert_eq!(db::token_label(&db, &token).as_deref(), Some("LBL"));
 }
 
 /// The lease: a holder that stops talking loses its session to
