@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [postgres-suites]
+        suite: [backend-matrix, postgres-suites]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -50,14 +50,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The network-free suites on Postgres. The db::lock tests are SQLite-only
+      # test hooks, so they are skipped by name rather than edited.
+      - name: Network-free suites on Postgres
+        if: matrix.suite == 'backend-matrix'
+        env:
+          TEST_DB: postgres
+        run: >
+          cargo test --test decoder --test anchoring --test pages --
+          --skip duplicate_bundle_is_idempotent
+          --skip anchoring_events_read_back_by_registry
+
       # The tests are #[ignore]d so plain `cargo test` needs no server; here
       # they must run, and fail rather than skip if PG_TEST_URL is missing.
-      - name: Replay, differential, migrations, locks and outages
+      - name: Replay, differential, grid, migrations, locks and outages
         if: matrix.suite == 'postgres-suites'
         run: |
           cargo test --lib -- --include-ignored
-          cargo test \
+          cargo test --features db-coverage \
             --test postgres --test migrations --test replay --test differential \
-            --test locks --test outage_drills \
+            --test grid --test locks --test indexer_pg --test outage_drills \
             -- --include-ignored
 

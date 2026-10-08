@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-//! The database a test runs against, and Postgres scratch schemas.
+//! The database a test runs against: SQLite, or Postgres under
+//! `TEST_DB=postgres`.
 //!
 //! Included by path (`#[path = "common/backend.rs"] mod backend;`) so a suite
 //! that needs only this does not compile the baseline helpers too.
@@ -12,7 +13,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use nvnmchain_explorer::db::{self, Db, DbConfig, DbUrl, Role};
+use nvnmchain_explorer::db::{self, Db, DbConfig, DbUrl, Role, Status};
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 
 /// Keep this alive as long as the database is used.
@@ -137,6 +138,17 @@ pub fn pg_config(url: &str, role: Role) -> DbConfig {
 /// A fresh database for one test. Keep the guard alive for as long as the
 /// database is used; dropping it removes the database.
 pub async fn temp_db(name: &str) -> (TempDb, Db) {
+    if on_postgres() {
+        let (scratch, url) = scratch_schema().await;
+        let cfg = pg_config(&url, Role::All);
+        let db = db::open_with(
+            &cfg,
+            tokio::sync::watch::channel(Status::starting(Role::All)).0,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("open {url}: {e:#}"));
+        return (TempDb::Postgres(scratch), db);
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
     (

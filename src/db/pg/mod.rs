@@ -198,12 +198,6 @@ pub(crate) async fn schema_version(read: &PgPool) -> Result<i64> {
     Ok(row.unwrap_or(0))
 }
 
-/// Not on Postgres yet: the home-page stats land with the rest of the
-/// indexer's jobs, before Postgres becomes selectable.
-pub(crate) async fn compute_and_store_stats(_: &PgDb) -> Result<serde_json::Value> {
-    anyhow::bail!("compute_and_store_stats: not implemented on Postgres yet")
-}
-
 /// One raw connection with `opts`, within 10 s.
 pub(crate) async fn connect(opts: &PgConnectOptions) -> Result<PgConnection> {
     let conn = tokio::time::timeout(Duration::from_secs(10), PgConnection::connect_with(opts))

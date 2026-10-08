@@ -8,9 +8,9 @@
 //! bare `db::x();` trips `unused_must_use`.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::{Arc, MutexGuard, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -92,7 +92,7 @@ pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<
     };
     let db = Db(Arc::new(Inner {
         backend,
-        labels: LabelCache::new(),
+        labels: LabelCache::new(cfg.role == Role::Indexer),
         status,
         role: cfg.role,
     }));
@@ -149,14 +149,20 @@ async fn reseed_until_ok(weak: Weak<Inner>, wait_first: bool) {
 /// query: one entry per `token_metadata` row, keyed by checksummed address.
 /// Entries are only ever added or replaced, which is exact because nothing
 /// deletes `token_metadata` rows.
+///
+/// Under `ROLE=indexer` it also notes the token addresses committed bundles
+/// name with no entry, for the missing-metadata job. Whatever takes both locks
+/// takes `labels` first.
 struct LabelCache {
     labels: RwLock<HashMap<String, String>>,
+    noted: Option<Mutex<HashSet<String>>>,
 }
 
 impl LabelCache {
-    fn new() -> Self {
+    fn new(note: bool) -> Self {
         LabelCache {
             labels: RwLock::default(),
+            noted: note.then(Mutex::default),
         }
     }
 
@@ -173,7 +179,8 @@ impl LabelCache {
     }
 
     /// After a committed batch: each bundle's tokens in order, so the last
-    /// metadata for an address wins, as it does in the write.
+    /// metadata for an address wins, as it does in the write. Then, under
+    /// `ROLE=indexer`, note what the bundles name and the cache lacks.
     fn committed(&self, bundles: &[BlockBundle]) {
         let mut map = self.write();
         for meta in bundles.iter().flat_map(|b| &b.tokens) {
@@ -181,6 +188,21 @@ impl LabelCache {
                 checksum_address(&meta.address),
                 Self::label(&meta.symbol, &meta.name),
             );
+        }
+        if let Some(noted) = &self.noted {
+            let named = bundles.iter().flat_map(|b| {
+                b.transfers
+                    .iter()
+                    .map(|t| t.token_addr.as_str())
+                    .chain(b.txs.iter().filter_map(|t| t.fee_token.as_deref()))
+            });
+            let mut noted = noted.lock().unwrap_or_else(|e| e.into_inner());
+            for address in named {
+                let address = checksum_address(address);
+                if !map.contains_key(&address) {
+                    noted.insert(address);
+                }
+            }
         }
     }
 
@@ -197,6 +219,19 @@ impl LabelCache {
     fn get(&self, address: &str) -> Option<String> {
         let map = self.labels.read().unwrap_or_else(|e| e.into_inner());
         map.get(address).filter(|l| !l.is_empty()).cloned()
+    }
+
+    fn take_noted(&self) -> Vec<String> {
+        let Some(noted) = &self.noted else {
+            return Vec::new();
+        };
+        // The labels before `noted`, as `committed` takes them: the other way
+        // round deadlocks against a commit.
+        let map = self.labels.read().unwrap_or_else(|e| e.into_inner());
+        let mut noted = noted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = noted.drain().filter(|a| !map.contains_key(a)).collect();
+        out.sort();
+        out
     }
 
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, String>> {
@@ -258,6 +293,13 @@ pub fn lock(db: &Db) -> MutexGuard<'_, Connection> {
 /// `None` when the token has neither, so the caller's later rules apply.
 pub fn token_label(db: &Db, address: &str) -> Option<String> {
     db.0.labels.get(address)
+}
+
+/// The token addresses committed bundles named that have no label, since the
+/// last call: the missing-metadata job's work. Always empty outside
+/// `ROLE=indexer`. An address with an empty label counts as known.
+pub fn take_tokens_without_metadata(db: &Db) -> Vec<String> {
+    db.0.labels.take_noted()
 }
 
 /// One `pub async fn` per line. `inline` calls the SQLite function of the
@@ -340,7 +382,7 @@ db_fn! {
     inline   fn compute_and_store_stats() -> Result<Value>;
     blocking fn repair_derived_tables();
     extra    fn try_min_block_number() -> Result<Option<i64>>;
-    extra    fn tokens_missing_metadata() -> Vec<String>;
+    extra    fn tokens_missing_metadata() -> Result<Vec<String>>;
     extra    fn try_all_token_metas() -> Result<Vec<TokenMetadata>>;
 }
 
@@ -488,6 +530,22 @@ pub mod testing {
             Backend::Sqlite(_) => None,
         }
     }
+
+    /// Rebuild `token_balances` and the holder counts from the transfer
+    /// history and the genesis balances, as a repair on an older database does.
+    pub async fn rebuild_token_balances(db: &Db) -> Result<()> {
+        match &db.0.backend {
+            Backend::Sqlite(_) => sqlite::rebuild_token_balances(&lock(db)),
+            Backend::Postgres(p) => p
+                .writer()?
+                .write(
+                    pg::writer::Budget::Long,
+                    |c| -> pg::writer::TxFuture<'_, ()> { Box::pin(pg::rebuild_token_balances(c)) },
+                )
+                .await
+                .map_err(anyhow::Error::new),
+        }
+    }
 }
 
 /// Which `db` functions ran, for the gate that every one runs on both backends.
@@ -511,6 +569,30 @@ pub mod coverage {
 mod tests {
     use super::*;
     use crate::decoder::checksum_address;
+
+    /// `committed` holds the labels' write lock while it takes `noted`. Were
+    /// `take_noted` to hold `noted` while it waits on the labels, a commit and
+    /// the missing-metadata job would deadlock.
+    #[test]
+    fn take_noted_never_holds_noted_while_a_commit_holds_the_labels() {
+        let cache = LabelCache::new(true);
+        std::thread::scope(|s| {
+            // Where `committed` stands before it takes `noted`.
+            let labels = cache.write();
+            let job = s.spawn(|| cache.take_noted());
+            let noted = cache.noted.as_ref().unwrap();
+            let until = std::time::Instant::now() + Duration::from_millis(200);
+            while std::time::Instant::now() < until {
+                assert!(
+                    !matches!(noted.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                    "take_noted holds `noted` while it waits on the labels"
+                );
+                std::thread::yield_now();
+            }
+            drop(labels);
+            assert!(job.join().unwrap().is_empty());
+        });
+    }
 
     const A: &str = "0x5555555555555555555555555555555555555501";
     const B: &str = "0x5555555555555555555555555555555555555502";

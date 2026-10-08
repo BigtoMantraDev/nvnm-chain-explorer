@@ -1,4 +1,4 @@
-//! The indexer's jobs on Postgres: the derived-table repair and the
+//! The indexer's jobs on Postgres: stats, the derived-table repair, and the
 //! genesis-balance scan. Set-based here, where `sqlite.rs` walks rows.
 //!
 //! Postgres has no Keccak-256, so the checksummed text keys of
@@ -6,7 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde_json::Value;
 use sqlx::{PgConnection, Row};
 
 use super::q;
@@ -23,6 +24,98 @@ fn get<T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>
     i: usize,
 ) -> Result<T, DbError> {
     row.try_get(i).map_err(|e| DbError::from_sqlx("decode", e))
+}
+
+/// The home page's numbers, from the counters the writer keeps and the blocks
+/// of the last day, stored in `kv` to seed the next start.
+pub(crate) async fn compute_and_store_stats(p: &PgDb) -> Result<Value> {
+    let now = now_ts();
+    let totals = q::try_query_opt(
+        &p.read,
+        "stats",
+        "SELECT COALESCE((SELECT n FROM counters WHERE name = 'blocks'), 0),
+                COALESCE((SELECT n FROM counters WHERE name = 'transactions'), 0),
+                (SELECT COUNT(*) FROM token_metadata),
+                (SELECT COALESCE(SUM(tx_count), 0)::int8 FROM blocks WHERE timestamp >= $1),
+                (SELECT COUNT(*) FROM blocks WHERE timestamp >= $1),
+                (SELECT MAX(number) FROM blocks),
+                (SELECT value FROM kv WHERE key = 'chain_head')",
+        |q| q.bind(now - 86400),
+        |r| {
+            Ok((
+                r.try_get::<i64, _>(0)?,
+                r.try_get::<i64, _>(1)?,
+                r.try_get::<i64, _>(2)?,
+                r.try_get::<i64, _>(3)?,
+                r.try_get::<i64, _>(4)?,
+                r.try_get::<Option<i64>, _>(5)?,
+                r.try_get::<Option<String>, _>(6)?,
+            ))
+        },
+    )
+    .await?
+    .context("stats: no row")?;
+    let (total_blocks, total_txns, token_count, txns_24h, blocks_24h, latest_block, head) = totals;
+    // The newest 100 blocks, by their millisecond timestamps.
+    let window = q::try_query_opt(
+        &p.read,
+        "stats window",
+        "SELECT COALESCE(MIN(timestamp_ms), 0), COALESCE(MAX(timestamp_ms), 0),
+                COALESCE(SUM(tx_count), 0)::int8,
+                COALESCE(SUM(CASE WHEN gas_limit > 0 THEN gas_used::float8 / gas_limit ELSE 0 END), 0)::float8,
+                COALESCE(SUM(CASE WHEN gas_limit > 0 THEN 1 ELSE 0 END), 0)::float8,
+                COUNT(*)
+         FROM (SELECT timestamp_ms, tx_count, gas_used, gas_limit
+               FROM blocks ORDER BY number DESC LIMIT $1) w",
+        |q| q.bind(100_i64),
+        |r| {
+            Ok((
+                r.try_get::<i64, _>(0)?,
+                r.try_get::<i64, _>(1)?,
+                r.try_get::<i64, _>(2)?,
+                r.try_get::<f64, _>(3)?,
+                r.try_get::<f64, _>(4)?,
+                r.try_get::<i64, _>(5)?,
+            ))
+        },
+    )
+    .await?
+    .unwrap_or((0, 0, 0, 0.0, 0.0, 0));
+    let (min_ms, max_ms, tx_sum, gas_sum, gas_den, n) = window;
+    let span_ms = (max_ms - min_ms).max(1) as f64;
+    let avg_block_time_ms = if n > 1 { span_ms / (n - 1) as f64 } else { 0.0 };
+    let tps = if span_ms > 0.0 {
+        tx_sum as f64 / span_ms * 1000.0
+    } else {
+        0.0
+    };
+    let gas_util_pct = if gas_den > 0.0 {
+        gas_sum / gas_den * 100.0
+    } else {
+        0.0
+    };
+    let chain_head: i64 = head.and_then(|v| v.parse().ok()).unwrap_or(0);
+    let index_pct = if chain_head > 0 {
+        (total_blocks as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let stats = serde_json::json!({
+        "latest_block": latest_block,
+        "total_blocks": total_blocks,
+        "total_txns": total_txns,
+        "token_count": token_count,
+        "txns_24h": txns_24h,
+        "blocks_24h": blocks_24h,
+        "avg_block_time_ms": avg_block_time_ms,
+        "tps": tps,
+        "gas_util_pct": gas_util_pct,
+        "chain_head": chain_head,
+        "index_pct": index_pct,
+        "updated_at": now,
+    });
+    super::write::set_kv(p, "stats", &stats.to_string()).await?;
+    Ok(stats)
 }
 
 /// Bring derived tables in line with what the reads assume, on the `Long`

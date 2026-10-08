@@ -866,7 +866,9 @@ async fn a_genesis_balance_counts_once() {
         db::get_token_holder_count(&db, &token).await,
         TRANSFER_COUNT + 1
     );
-    db::rebuild_token_balances(&db::lock(&db)).expect("rebuild");
+    db::testing::rebuild_token_balances(&db)
+        .await
+        .expect("rebuild");
     assert_eq!(held(&db).await.as_deref(), Some("70000000"));
     assert_eq!(
         db::get_token_holder_count(&db, &token).await,

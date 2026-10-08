@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 
-use super::{blob_addr, get_min_block_number, lock, query_rows, row_to_token, Db, TOKEN_COLS};
+use super::{blob_addr, get_min_block_number, lock, row_to_token, Db, TOKEN_COLS};
 use crate::models::TokenMetadata;
 
 /// `get_min_block_number` as a `Result`, for the backfill loop. SQLite has no
@@ -12,20 +12,39 @@ pub fn try_min_block_number(db: &Db) -> Result<Option<i64>> {
     Ok(get_min_block_number(db))
 }
 
-/// Token addresses a transfer or a fee names that have no metadata row.
-pub fn tokens_missing_metadata(db: &Db) -> Vec<String> {
-    query_rows(
-        &lock(db),
-        "tokens_missing_metadata",
-        "SELECT a FROM (
-             SELECT token_addr AS a FROM transfer_events
-             UNION
-             SELECT fee_token FROM transactions WHERE fee_token IS NOT NULL
-         ) used
-         WHERE NOT EXISTS (SELECT 1 FROM token_metadata m WHERE m.address = used.a)",
-        [],
-        |r| Ok(blob_addr(&r.get::<_, Vec<u8>>(0)?)),
-    )
+/// Token addresses a transfer or a fee names that have no metadata row, or
+/// why they could not be read: a failed scan is not "none missing".
+/// Undecodable rows are dropped and logged, as `query_rows` does.
+pub fn tokens_missing_metadata(db: &Db) -> Result<Vec<String>> {
+    let conn = lock(db);
+    let mut stmt = conn
+        .prepare(
+            "SELECT a FROM (
+                 SELECT token_addr AS a FROM transfer_events
+                 UNION
+                 SELECT fee_token FROM transactions WHERE fee_token IS NOT NULL
+             ) used
+             WHERE NOT EXISTS (SELECT 1 FROM token_metadata m WHERE m.address = used.a)",
+        )
+        .context("tokens_missing_metadata")?;
+    let rows = stmt
+        .query_map([], |r| Ok(blob_addr(&r.get::<_, Vec<u8>>(0)?)))
+        .context("tokens_missing_metadata")?;
+    let mut out = Vec::new();
+    let (mut dropped, mut first) = (0usize, None);
+    for row in rows {
+        match row {
+            Ok(address) => out.push(address),
+            Err(e) => {
+                dropped += 1;
+                first.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    if let Some(e) = first {
+        tracing::warn!("tokens_missing_metadata: dropped {dropped} undecodable row(s); first: {e}");
+    }
+    Ok(out)
 }
 
 /// Every token-metadata row, or why they could not be read. Unlike
@@ -110,7 +129,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let mut missing = tokens_missing_metadata(&db);
+        let mut missing = tokens_missing_metadata(&db).unwrap();
         missing.sort();
         let mut want = vec![named, fee];
         want.sort();
@@ -128,5 +147,18 @@ mod tests {
             .execute_batch("DROP TABLE token_metadata")
             .unwrap();
         assert!(try_all_token_metas(&db).is_err());
+    }
+
+    /// The missing-metadata job retries a scan that fails, so a failure must
+    /// not read as "none missing".
+    #[test]
+    fn a_failed_missing_metadata_scan_is_an_error() {
+        let (_dir, db) = temp_db();
+        assert!(tokens_missing_metadata(&db).unwrap().is_empty());
+
+        sqlite::lock(&db)
+            .execute_batch("DROP TABLE token_metadata")
+            .unwrap();
+        assert!(tokens_missing_metadata(&db).is_err());
     }
 }

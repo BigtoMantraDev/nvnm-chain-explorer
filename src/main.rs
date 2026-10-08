@@ -29,10 +29,6 @@ async fn main() -> anyhow::Result<()> {
     if db_cfg.role != Role::All {
         anyhow::bail!("ROLE={} is not available yet; run as ROLE=all", db_cfg.role);
     }
-    // Until the indexer's jobs run on it, Postgres is for the test suites only.
-    if matches!(db_cfg.target, DbTarget::Postgres(_)) {
-        anyhow::bail!("DATABASE_URL: the Postgres backend is not available yet; use DB_PATH");
-    }
     info!(
         "starting nvnmchain Explorer (rpc={}, db={})",
         cfg.rpc_url,
@@ -51,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let tera = web::build_tera(db.clone())?;
 
     // Background indexer: instant heads via WebSocket (poll fallback),
-    // concurrent block fetching, serialized SQLite writes.
+    // concurrent block fetching, one serialized database writer.
     let indexer_rpc = ChainRpc::from_settings(&cfg)?;
     let indexer_db = db.clone();
     let indexer_cfg = IndexerConfig::from_settings(&cfg);
