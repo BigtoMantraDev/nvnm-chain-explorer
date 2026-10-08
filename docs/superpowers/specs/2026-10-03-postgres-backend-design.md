@@ -719,7 +719,7 @@ flowchart TD
     B --> C["BEGIN IMMEDIATE"]
     C --> D{"schema_migrations has v1?"}
     D -->|"no: fresh or legacy file"| E["create table, stamp v1 (BASELINE_SHA3)"]
-    D -->|yes| F["verify checksums"]
+    D -->|yes| F["verify versions and checksums"]
     E --> F
     F --> G{"D > B?"}
     G -->|yes| R["ROLLBACK, refuse"]
@@ -773,13 +773,20 @@ A guard test checks every N: temp file → `init_db` → 0002..N → hash →
 ### The Postgres runner
 
 **Where it runs.** On the writer session after it wins the lock and passes
-the self-checks (section 6), and again after every re-acquire.
+the self-checks (section 6), and again after every re-acquire. Like other
+`Long` work it runs under the watchdog, since its statements have no
+timeout.
 
 **What it refuses.** A lock-free **preflight**, run before the candidate
-loop (section 8), catches all of these before the lock is taken:
+loop (section 8), catches all of these before the lock is taken. The
+writer runs it again on its own session once it holds the lock, before the
+runner, since a newer release may have migrated while it waited:
 
 - a schema that has tables but no `schema_migrations`, i.e. one applied by
   hand. The remedy is to drop the schema and re-index;
+- a version missing below the highest. The runner records versions in
+  order, so a gap means rows edited by hand, and which files ran is
+  unknown. The remedy is the same;
 - a checksum mismatch;
 - D > B. There is no override: rolling back across a migration means
   rolling forward;
@@ -937,13 +944,13 @@ re-derivable and `writer_seq` catches a lost suffix.
 ```mermaid
 stateDiagram-v2
     [*] --> Preflight: open_with (ROLE=indexer or all)
-    Preflight --> Candidate: schema, checksums, D ≤ B, indexes valid
+    Preflight --> Candidate: schema, no gaps, checksums, D ≤ B, indexes valid
     Preflight --> [*]: refuse (exit 1, never Ready)
     Candidate --> Candidate: try_lock false, retry every 5 s on the same session
-    Candidate --> Leader: try_lock true, self-checks, migrate, grants
+    Candidate --> Leader: try_lock true, self-checks, preflight, migrate, grants
     Leader --> Leader: batch committed (writer_seq bumped)
     Leader --> Reacquiring: Unavailable error, timeout, session lost
-    Reacquiring --> Leader: reconnect, try_lock true, self-checks, writer_seq matches
+    Reacquiring --> Leader: reconnect, try_lock true, self-checks, writer_seq matches, preflight, migrate, grants
     Reacquiring --> SeqMismatch: writer_seq not this run's last or last+1
     Reacquiring --> Lost: try_lock false for 120 s
     SeqMismatch --> [*]: exit 4, restart from the database's truth
@@ -956,7 +963,10 @@ runs `SELECT pg_try_advisory_lock(K1, K_WRITER)` (5 s timeout).
 - **On `false`:** it retries every 5 s on the same session, so the session
   never idles past `idle_session_timeout`. A standby spawns no jobs.
 - **On `true`:** it runs the self-checks, records the pid, runs the
-  migrations and grants, and becomes Leader. The self-checks are:
+  preflight again, then the migrations and grants under the `Long`
+  watchdog, and becomes Leader. A refusal there exits 1, as at the
+  preflight; a grant that fails for any reason but a missing role is
+  `Unavailable`. The self-checks are:
   - `SELECT NOT pg_is_in_recovery()`. A replica, such as the Kubernetes
     `-ro` Service or a read-replica address, is treated as `Unavailable`.
     If it is still in recovery after the 120 s window, the process exits

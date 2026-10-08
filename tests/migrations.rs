@@ -231,6 +231,35 @@ async fn a_newer_postgres_database_is_refused_before_the_lock() {
     drop(leader);
 }
 
+/// A version missing below the highest is refused at preflight: the runner
+/// records versions in order, so a gap means the rows were edited by hand.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_gap_in_postgres_versions_is_refused_before_the_lock() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    let leader = db::open_with(
+        &indexer(&url),
+        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
+    )
+    .await
+    .unwrap();
+    let (missing, found) = (
+        db::migrations::binary_version() + 1,
+        db::migrations::binary_version() + 2,
+    );
+    pg_exec(
+        &url,
+        &format!("INSERT INTO schema_migrations VALUES ({found}, 'later', 'x', 0, 'test')"),
+    )
+    .await;
+    let err = refusal(&indexer(&url)).await;
+    assert!(
+        err.contains(&format!("has version {found} but not {missing}")),
+        "{err}"
+    );
+    drop(leader);
+}
+
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn a_schema_applied_by_hand_is_refused() {

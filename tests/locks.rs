@@ -107,6 +107,45 @@ async fn a_second_writer_waits_as_a_candidate_until_the_lock_is_free() {
     db::save_block(&second, &bundle(1).block).await.unwrap();
 }
 
+/// A newer release may lead, and migrate, while a candidate waits: the
+/// candidate re-runs the preflight once it holds the lock, and refuses rather
+/// than run an older binary against the newer schema.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_candidate_refuses_a_database_migrated_while_it_waited() {
+    let (_scratch, url) = backend::scratch_schema().await;
+    let (first, _) = open(&fast(&url, Role::Indexer)).await;
+
+    let cfg = fast(&url, Role::Indexer);
+    let (tx, mut status) = watch::channel(Status::starting(Role::Indexer));
+    let second = tokio::spawn(async move { db::open_with(&cfg, tx).await });
+    status
+        .wait_for(|s| s.writer == Some(WriterState::Candidate))
+        .await
+        .unwrap();
+    // What a newer release leaves behind once it has led.
+    let newer = db::migrations::binary_version() + 1;
+    exec(
+        &url,
+        &format!("INSERT INTO schema_migrations VALUES ({newer}, 'later', 'x', 0, 'test')"),
+    )
+    .await;
+
+    drop(first);
+    let err = tokio::time::timeout(Duration::from_secs(10), second)
+        .await
+        .expect("the lock is free once the first writer closes")
+        .expect("no panic: a newer database is refused under the lock")
+        .err()
+        .expect("refused");
+    let err = format!("{err:#}");
+    assert!(err.contains("exit 1"), "{err}");
+    assert_eq!(
+        count(&url, "SELECT MAX(version) FROM schema_migrations").await,
+        newer
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn two_indexers_starting_together_migrate_once() {

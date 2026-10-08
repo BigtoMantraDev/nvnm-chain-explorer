@@ -480,12 +480,31 @@ impl Writer {
         }
     }
 
-    /// With the lock just won: check the session, record its pid, migrate and
-    /// grant, and say so.
+    /// With the lock just won: check the session, record its pid, run the
+    /// preflight again, migrate and grant, and say so. The candidate's
+    /// preflight ran before a wait with no bound, and a re-acquire skips it, so
+    /// a newer release may have migrated in between; under the lock, D cannot
+    /// move. The migrations have no statement timeout, so like other `Long`
+    /// work they run under the watchdog.
     async fn lead(&self, conn: &mut PgConnection) -> Result<(), DbError> {
         let pid = self_checks(conn).await?;
         self.0.pid.store(pid, Relaxed);
-        migrate::run(conn, &self.0.web_role).await?;
+        let migrate = async {
+            match migrate::preflight(conn).await {
+                Ok(()) => {}
+                Err(migrate::PreflightError::Refused(e)) => {
+                    return Err(self.fatal(1, format!("{e:#}")))
+                }
+                Err(migrate::PreflightError::Unavailable(e)) => {
+                    return Err(DbError::Unavailable(e))
+                }
+            }
+            migrate::run(conn, &self.0.web_role).await
+        };
+        tokio::select! {
+            r = migrate => r?,
+            e = self.watchdog() => return Err(e),
+        }
         self.0.status.send_modify(|s| {
             s.writer = Some(WriterState::Leader);
             s.schema.db = Some(migrations::binary_version());

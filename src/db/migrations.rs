@@ -51,6 +51,16 @@ migrations! {
     0001 => "baseline";
 }
 
+/// The first version a database's rows skip, and the version found in its
+/// place. The runners record versions in order, so a gap means hand edits.
+pub fn first_gap(applied: impl IntoIterator<Item = i64>) -> Option<(i64, i64)> {
+    applied
+        .into_iter()
+        .zip(1..)
+        .find(|(have, want)| have != want)
+        .map(|(have, want)| (want, have))
+}
+
 /// B: the newest version this binary knows.
 pub fn binary_version() -> i64 {
     MIGRATIONS.last().map_or(0, |m| m.version)
@@ -458,6 +468,15 @@ pub fn check_list(list: &[Migration]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_gap_names_the_first_skipped_version() {
+        assert_eq!(first_gap([]), None);
+        assert_eq!(first_gap([1, 2, 3]), None);
+        assert_eq!(first_gap([1, 3]), Some((2, 3)));
+        assert_eq!(first_gap([2]), Some((1, 2)));
+        assert_eq!(first_gap([1, 2, 4, 5]), Some((3, 4)));
+    }
 
     const EXPAND: &str = "-- kind: expand\n";
 

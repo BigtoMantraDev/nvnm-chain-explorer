@@ -7,8 +7,8 @@ use super::q;
 use super::DbError;
 use crate::db::config::is_identifier;
 use crate::db::migrations::{
-    binary_version, checksum, concurrent_indexes, headers, postgres_checksums, split_at_line_end,
-    Migration, MIGRATIONS,
+    binary_version, checksum, concurrent_indexes, first_gap, headers, postgres_checksums,
+    split_at_line_end, Migration, MIGRATIONS,
 };
 use crate::db::now_ts;
 
@@ -31,6 +31,7 @@ impl From<sqlx::Error> for PreflightError {
 /// unready, or exits, and never replaces a working leader:
 ///
 /// - a schema with tables but no `schema_migrations`, i.e. applied by hand;
+/// - a version missing below the highest, i.e. rows edited by hand;
 /// - a migration whose file changed after it was applied;
 /// - a database newer than this binary (D > B);
 /// - an INVALID index, unless `REINDEX CONCURRENTLY` is building it or a
@@ -59,6 +60,12 @@ pub(crate) async fn preflight(conn: &mut PgConnection) -> Result<(), PreflightEr
             .iter()
             .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
             .collect::<Result<_, sqlx::Error>>()?;
+    if let Some((missing, found)) = first_gap(applied.iter().map(|(v, _)| *v)) {
+        return Err(PreflightError::Refused(anyhow!(
+            "schema_migrations has version {found} but not {missing}: its rows were edited by \
+             hand, so which files ran is unknown. Drop the schema and re-index from the chain"
+        )));
+    }
     let binary = binary_version();
     let db = applied.last().map_or(0, |(v, _)| *v);
     if db > binary {
@@ -132,12 +139,23 @@ pub(crate) async fn run(conn: &mut PgConnection, web_role: &str) -> Result<(), D
     .map_err(|e| unavailable("read the schema version", e))?
     .try_get(0)
     .map_err(|e| unavailable("read the schema version", e))?;
-    for m in &MIGRATIONS[db as usize..] {
+    // The writer re-runs the preflight under the lock, so D <= B here.
+    let pending = usize::try_from(db)
+        .ok()
+        .and_then(|d| MIGRATIONS.get(d..))
+        .ok_or_else(|| {
+            unavailable(
+                "schema version",
+                format!("{db} is newer than this binary's {}", binary_version()),
+            )
+        })?;
+    for m in pending {
         apply(conn, m).await?;
         tracing::info!("applied migration {:04}_{}", m.version, m.name);
     }
-    grant(conn, web_role).await;
-    Ok(())
+    grant(conn, web_role)
+        .await
+        .map_err(|e| unavailable(&format!("grant the web role {web_role:?}"), e))
 }
 
 async fn apply(conn: &mut PgConnection, m: &'static Migration) -> Result<(), DbError> {
@@ -237,37 +255,38 @@ async fn apply_concurrently(conn: &mut PgConnection, m: &'static Migration) -> R
 /// What web replicas may do: read everything, and write the two caches. Run
 /// after every start, since a migration that recreates a table drops its
 /// grants. A missing role is a warning, not an error: docker-compose and CI
-/// create only `explorer`.
-async fn grant(conn: &mut PgConnection, web_role: &str) {
-    let result: Result<()> = async {
-        let row = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1), current_schema()",
-        )
-        .bind(web_role)
-        .fetch_one(&mut *conn)
-        .await?;
-        let (exists, schema): (bool, String) = (row.try_get(0)?, row.try_get(1)?);
-        if !exists {
-            tracing::warn!("web role {web_role:?} does not exist; skipping its grants");
-            return Ok(());
-        }
-        if !is_identifier(web_role) || !is_identifier(&schema) {
-            anyhow::bail!("not plain identifiers: role {web_role:?}, schema {schema:?}");
-        }
-        let sql = format!(
+/// create only `explorer`. Any other failure is returned, so the writer never
+/// leads without its web role's grants.
+async fn grant(conn: &mut PgConnection, web_role: &str) -> Result<(), String> {
+    let row =
+        sqlx::query("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1), current_schema()")
+            .bind(web_role)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| describe(&e))?;
+    let exists: bool = row.try_get(0).map_err(|e| describe(&e))?;
+    let schema: String = row.try_get(1).map_err(|e| describe(&e))?;
+    if !exists {
+        tracing::warn!("web role {web_role:?} does not exist; skipping its grants");
+        return Ok(());
+    }
+    if !is_identifier(web_role) || !is_identifier(&schema) {
+        return Err(format!(
+            "not plain identifiers: role {web_role:?}, schema {schema:?}"
+        ));
+    }
+    let sql = format!(
             "GRANT USAGE ON SCHEMA \"{schema}\" TO \"{web_role}\";
              GRANT SELECT ON ALL TABLES IN SCHEMA \"{schema}\" TO \"{web_role}\";
              GRANT INSERT, UPDATE ON selector_names TO \"{web_role}\";
              GRANT UPDATE (trace_data) ON transactions TO \"{web_role}\";
              ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" GRANT SELECT ON TABLES TO \"{web_role}\""
-        );
-        sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut *conn).await?;
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        tracing::error!("granting the web role {web_role:?}: {e:#}");
-    }
+    );
+    sqlx::raw_sql(AssertSqlSafe(sql))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| describe(&e))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -335,5 +354,64 @@ mod tests {
             .execute(&mut admin)
             .await
             .unwrap();
+    }
+
+    /// A grant that fails for any reason but a missing role fails the run, so
+    /// the writer never leads without its web role's grants, and the next run
+    /// grants again. Needs `PG_TEST_URL`.
+    #[tokio::test]
+    #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+    async fn a_failed_grant_fails_the_run() {
+        let url = std::env::var("PG_TEST_URL").expect("PG_TEST_URL");
+        let schema = format!("t_{}_900001", std::process::id());
+        let role = format!("t_grant_{}", std::process::id());
+        let mut admin = PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};
+             DROP ROLE IF EXISTS {role}; CREATE ROLE {role}"
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+        let mut conn = PgConnection::connect(&format!("{url}?options[search_path]={schema}"))
+            .await
+            .unwrap();
+        run(&mut conn, &role).await.unwrap();
+
+        // On a healthy session, a grant that cannot apply: a column it names
+        // is gone.
+        sqlx::raw_sql("ALTER TABLE transactions RENAME COLUMN trace_data TO trace_data_gone")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let err = run(&mut conn, &role)
+            .await
+            .expect_err("a failed grant fails the run");
+        assert!(matches!(err, DbError::Unavailable(_)), "{err}");
+        assert!(err.to_string().contains("42703"), "{err}");
+
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "ALTER TABLE transactions RENAME COLUMN trace_data_gone TO trace_data;
+             REVOKE ALL ON transactions FROM {role}"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        run(&mut conn, &role).await.unwrap();
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1, 'transactions', 'trace_data', 'UPDATE')",
+        )
+        .bind(&role)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert!(granted, "the next run grants again");
+        drop(conn);
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "DROP SCHEMA {schema} CASCADE; DROP OWNED BY {role}; DROP ROLE {role}"
+        )))
+        .execute(&mut admin)
+        .await
+        .unwrap();
     }
 }
