@@ -1,12 +1,15 @@
-//! The explorer's database: one async API, with SQLite behind it.
+//! The explorer's database: one async API in front of SQLite and Postgres.
 //!
 //! Every function here dispatches on the backend. The SQLite arm calls the
 //! rusqlite code in `sqlite.rs` inline, as before the API was async, so SQLite
-//! behaves exactly as it did. A forgotten `.await` fails CI: `let _ = db::x()`
-//! trips `clippy::let_underscore_future`, and a bare `db::x();` trips
-//! `unused_must_use`.
+//! behaves exactly as it did. The Postgres arm calls a hand-written twin in
+//! `pg/`, which must exist or this does not compile. A forgotten `.await`
+//! fails CI: `let _ = db::x()` trips `clippy::let_underscore_future`, and a
+//! bare `db::x();` trips `unused_must_use`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, MutexGuard, RwLock, Weak};
 use std::time::Duration;
 
@@ -21,10 +24,11 @@ use crate::tokens::TokenMeta;
 
 mod config;
 pub mod migrations;
+pub(crate) mod pg;
 mod sqlite;
 mod status;
 
-pub use config::{DbConfig, DbTarget, Role};
+pub use config::{DbConfig, DbTarget, DbUrl, PasswordSource, Role, Tuning};
 pub use status::{SchemaVersions, Status};
 
 #[doc(hidden)]
@@ -46,17 +50,24 @@ struct Inner {
 
 enum Backend {
     Sqlite(sqlite::Db),
+    // Boxed: the pools and the writer dwarf the SQLite handle.
+    Postgres(Box<pg::PgDb>),
 }
 
-/// Open a SQLite database as `ROLE=all` and bring its schema up to date,
-/// creating the file if needed.
-pub async fn open(path: &str) -> Result<Db> {
-    let cfg = DbConfig::sqlite(path);
+/// Open a database as `ROLE=all` and bring its schema up to date. A Postgres
+/// URL, with or without its scheme (`localhost:5432` counts), picks Postgres;
+/// anything else is a SQLite path, created if needed.
+pub async fn open(path_or_url: &str) -> Result<Db> {
+    let cfg = match DbTarget::parse(path_or_url)? {
+        DbTarget::Sqlite(path) => DbConfig::sqlite(&path),
+        DbTarget::Postgres(url) => DbConfig::postgres(url, Role::All),
+    };
     open_with(&cfg, watch::channel(Status::starting(Role::All)).0).await
 }
 
 /// Open the configured database for `cfg.role`, publishing progress on
-/// `status`, which `/readyz` reads.
+/// `status`, which `/readyz` reads. On Postgres the pools are lazy and this
+/// never waits on the database.
 pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<Db> {
     let backend = match &cfg.target {
         DbTarget::Sqlite(path) => {
@@ -71,6 +82,7 @@ pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> Result<
             status.send_modify(|s| s.schema.db = Some(migrations::binary_version()));
             Backend::Sqlite(s)
         }
+        DbTarget::Postgres(_) => Backend::Postgres(Box::new(pg::open(cfg, &status).await?)),
     };
     let db = Db(Arc::new(Inner {
         backend,
@@ -191,11 +203,29 @@ pub fn role(db: &Db) -> Role {
     db.0.role
 }
 
+/// Run `f`, and say whether any database read in it failed. The 503
+/// middleware wraps each request in this.
+pub async fn track_failures<F: Future>(f: F) -> (F::Output, bool) {
+    pg::DB_FAILED
+        .scope(Cell::new(false), async {
+            let out = f.await;
+            let failed = pg::DB_FAILED.with(Cell::get);
+            (out, failed)
+        })
+        .await
+}
+
+/// Statements this process has sent to Postgres, for round-trip budgets.
+pub fn statements() -> u64 {
+    pg::q::statements()
+}
+
 /// The SQLite connection, for tests that inspect or tamper with rows directly.
 /// Never hold the guard across an `.await`.
 pub fn lock(db: &Db) -> MutexGuard<'_, Connection> {
     match &db.0.backend {
         Backend::Sqlite(s) => sqlite::lock(s),
+        Backend::Postgres(_) => panic!("db::lock is a SQLite-only test hook"),
     }
 }
 
@@ -208,7 +238,8 @@ pub fn token_label(db: &Db, address: &str) -> Option<String> {
 
 /// One `pub async fn` per line. `inline` calls the SQLite function of the
 /// same name on the caller's task; `extra` calls one in `sqlite/extra.rs`;
-/// `blocking` runs it on tokio's blocking pool.
+/// `blocking` runs it on tokio's blocking pool. On Postgres each calls
+/// `pg::` of the same name.
 macro_rules! db_fn {
     (@call inline $s:ident $n:ident ($($a:ident),*)) => { sqlite::$n($s, $($a),*) };
     (@call extra $s:ident $n:ident ($($a:ident),*)) => { sqlite::extra::$n($s, $($a),*) };
@@ -226,6 +257,7 @@ macro_rules! db_fn {
                 coverage::hit(stringify!($n));
                 match &db.0.backend {
                     Backend::Sqlite(s) => db_fn!(@call $side s $n ($($a),*)),
+                    Backend::Postgres(p) => pg::$n(p, $($a),*).await,
                 }
             }
         )*
@@ -297,6 +329,7 @@ pub async fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> 
     coverage::hit("save_block_bundles");
     match &db.0.backend {
         Backend::Sqlite(s) => sqlite::save_block_bundles(s, bundles)?,
+        Backend::Postgres(p) => pg::save_block_bundles(p, bundles).await?,
     }
     db.0.labels.committed(bundles);
     Ok(())
@@ -309,6 +342,8 @@ pub async fn save_block_bundle(db: &Db, bundle: &BlockBundle) -> Result<()> {
     let one = std::slice::from_ref(bundle);
     match &db.0.backend {
         Backend::Sqlite(s) => sqlite::save_block_bundle(s, bundle)?,
+        // No singular twin: one bundle is a batch of one.
+        Backend::Postgres(p) => pg::save_block_bundles(p, one).await?,
     }
     db.0.labels.committed(one);
     Ok(())
@@ -323,11 +358,29 @@ pub async fn save_token_metadata(db: &Db, meta: &TokenMeta) -> Result<()> {
             db.0.labels.put(meta);
             Ok(())
         }
+        // A page view can be dropped mid-save (ROLE=all). The write runs on in
+        // its spawned task, so the put must run in the same task.
+        Backend::Postgres(_) => {
+            let (db, meta) = (db.clone(), meta.clone());
+            let task = tokio::spawn(async move {
+                let Backend::Postgres(p) = &db.0.backend else {
+                    unreachable!()
+                };
+                pg::save_token_metadata(p, &meta).await?;
+                db.0.labels.put(&meta);
+                anyhow::Ok(())
+            });
+            match task.await {
+                Ok(r) => r,
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            }
+        }
     }
 }
 
 /// Store a window of anchoring events and advance its watermark, atomically.
-/// `events` gets a block-timestamp lookup and must be deterministic.
+/// `events` gets a block-timestamp lookup and must be deterministic: Postgres
+/// calls it twice, once to learn which blocks it stamps.
 pub async fn save_anchoring_window(
     db: &Db,
     key: &str,
@@ -338,14 +391,16 @@ pub async fn save_anchoring_window(
     coverage::hit("save_anchoring_window");
     match &db.0.backend {
         Backend::Sqlite(s) => sqlite::save_anchoring_window(s, key, value, events),
+        Backend::Postgres(p) => pg::save_anchoring_window(p, key, value, events).await,
     }
 }
 
-/// D: the database's schema version. An open SQLite file is always at this
-/// binary's version.
+/// D: the database's schema version, read from the database. On SQLite, an
+/// open file is always at this binary's version.
 pub async fn schema_version(db: &Db) -> Result<i64> {
     match &db.0.backend {
         Backend::Sqlite(_) => Ok(migrations::binary_version()),
+        Backend::Postgres(p) => pg::schema_version(&p.read).await,
     }
 }
 

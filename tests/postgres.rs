@@ -253,6 +253,39 @@ async fn catalog(conn: &mut PgConnection) -> Vec<String> {
         .unwrap_or_else(|e| panic!("read the catalog: {}", pg_error(&e)))
 }
 
+/// The explorer's own read of D: 0 on a database no migration has touched,
+/// then the newest version once `schema_migrations` exists. It opens as a web
+/// replica, which reads D and never migrates.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn the_schema_version_is_0_before_any_migration() {
+    use nvnmchain_explorer::db::{DbConfig, DbUrl, Role, Status};
+    let mut pg = scratch("schema_version").await;
+    let base = std::env::var("PG_TEST_URL").unwrap();
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let url = format!("{base}{sep}options[search_path]={}", pg.schema);
+    let db = nvnmchain_explorer::db::open_with(
+        &DbConfig::postgres(DbUrl(url), Role::Web),
+        tokio::sync::watch::channel(Status::starting(Role::Web)).0,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("open {}: {e:#}", pg.schema));
+    let version = nvnmchain_explorer::db::schema_version(&db).await;
+    assert_eq!(version.map_err(|e| format!("{e:#}")), Ok(0));
+
+    pg.apply_schema().await;
+    sqlx::raw_sql(
+        "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY); \
+         INSERT INTO schema_migrations VALUES (1)",
+    )
+    .execute(&mut pg.conn)
+    .await
+    .unwrap_or_else(|e| panic!("stamp version 1: {}", pg_error(&e)));
+    let version = nvnmchain_explorer::db::schema_version(&db).await;
+    assert_eq!(version.map_err(|e| format!("{e:#}")), Ok(1));
+    pg.finish().await;
+}
+
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn applying_the_schema_twice_changes_nothing() {
