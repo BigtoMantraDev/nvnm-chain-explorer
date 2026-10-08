@@ -109,6 +109,16 @@ impl DbUrl {
     pub fn has_user(&self) -> bool {
         url::Url::parse(&self.0).is_ok_and(|u| !u.username().is_empty())
     }
+
+    /// The `sslmode` (or `ssl-mode`) the URL names, the last of several, as
+    /// sqlx reads it.
+    pub fn ssl_mode(&self) -> Option<String> {
+        let url = url::Url::parse(&self.0).ok()?;
+        url.query_pairs()
+            .filter(|(key, _)| key == "sslmode" || key == "ssl-mode")
+            .last()
+            .map(|(_, mode)| mode.into_owned())
+    }
 }
 
 impl fmt::Display for DbUrl {
@@ -166,6 +176,8 @@ pub struct DbConfig {
     pub user: Option<String>,
     /// `PGPASSWORD`, applied when the URL carries no password.
     pub password: Option<Secret>,
+    /// `PGSSLMODE`, which the URL's own `sslmode` overrides.
+    pub ssl_mode: Option<String>,
     pub tuning: Tuning,
 }
 
@@ -198,6 +210,7 @@ impl DbConfig {
             target,
             user: set("PGUSER"),
             password: lookup("PGPASSWORD").filter(|p| !p.is_empty()).map(Secret),
+            ssl_mode: set("PGSSLMODE"),
             tuning: Tuning::default(),
         })
     }
@@ -209,6 +222,7 @@ impl DbConfig {
             target: DbTarget::Sqlite(path.to_string()),
             user: None,
             password: None,
+            ssl_mode: None,
             tuning: Tuning::default(),
         }
     }
@@ -222,6 +236,7 @@ impl DbConfig {
             target: DbTarget::Postgres(url),
             user: env("PGUSER"),
             password: env("PGPASSWORD").map(Secret),
+            ssl_mode: env("PGSSLMODE"),
             tuning: Tuning::default(),
         }
     }
@@ -238,8 +253,9 @@ impl DbConfig {
 
     /// The connect options for the Postgres URL, credentials applied. This
     /// build has no TLS, so every connection is plaintext: run the database on
-    /// a private network. A URL whose `sslmode` asks for TLS is refused, never
-    /// quietly downgraded.
+    /// a private network. Any `sslmode` but `disable`, the URL's or
+    /// `PGSSLMODE`, is refused, never quietly downgraded: `prefer` and `allow`
+    /// would try TLS too. Naming none is plaintext.
     pub fn pg_options(&self) -> Result<sqlx::postgres::PgConnectOptions> {
         use sqlx::postgres::{PgConnectOptions, PgSslMode};
         let DbTarget::Postgres(url) = &self.target else {
@@ -256,13 +272,17 @@ impl DbConfig {
                 opts = opts.password(password);
             }
         }
-        match opts.get_ssl_mode() {
-            PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer => {}
-            mode => bail!(
-                "{url}: sslmode={} needs TLS, which this build does not support; \
-                 connect over a private network with no sslmode (or sslmode=disable)",
-                format!("{mode:?}").to_lowercase()
-            ),
+        let asked = match url.ssl_mode() {
+            Some(mode) => Some(("sslmode", mode)),
+            None => self.ssl_mode.clone().map(|mode| ("PGSSLMODE", mode)),
+        };
+        if let Some((key, mode)) = asked {
+            if !mode.trim().eq_ignore_ascii_case("disable") {
+                bail!(
+                    "{url}: {key}={mode} may use TLS, which this build does not support; \
+                     connect over a private network with no sslmode (or sslmode=disable)"
+                );
+            }
         }
         Ok(opts.ssl_mode(PgSslMode::Disable))
     }
@@ -452,14 +472,15 @@ mod tests {
         );
     }
 
-    /// This build has no TLS: every connection is plaintext, so a URL that asks
-    /// for TLS is refused rather than quietly downgraded.
+    /// This build has no TLS: every connection is plaintext, so any sslmode
+    /// but `disable` is refused rather than quietly downgraded, `prefer` and
+    /// `allow` included, since both would try TLS.
     #[test]
     fn connections_are_plaintext_and_a_url_asking_for_tls_is_refused() {
         for url in [
             "postgres://db.internal:5432/x",
             "postgres://db.internal:5432/x?sslmode=disable",
-            "postgres://db.internal:5432/x?sslmode=prefer",
+            "postgres://db.internal:5432/x?sslmode=DISABLE",
             "postgres://localhost:5432/x",
             "postgres:///x?host=/var/run/postgresql",
         ] {
@@ -471,13 +492,39 @@ mod tests {
             );
         }
         for url in [
+            "postgres://db.internal:5432/x?sslmode=allow",
+            "postgres://db.internal:5432/x?sslmode=prefer",
+            "postgres://db.internal:5432/x?ssl-mode=prefer",
+            "postgres://db.internal:5432/x?sslmode=disable&sslmode=prefer",
             "postgres://db.internal:5432/x?sslmode=require",
             "postgres://db.internal:5432/x?sslmode=verify-ca",
             "postgres://db.internal:5432/x?sslmode=verify-full",
         ] {
             let cfg = DbConfig::from_env(env(&[("DATABASE_URL", url)])).unwrap();
-            let err = format!("{:#}", cfg.pg_options().unwrap_err());
-            assert!(err.contains("TLS"), "{url}: {err}");
+            let err = cfg.pg_options().map(|_| ()).map_err(|e| format!("{e:#}"));
+            assert!(
+                err.as_ref().is_err_and(|e| e.contains("TLS")),
+                "{url}: {err:?}"
+            );
+        }
+        // PGSSLMODE counts the same, and the URL's own sslmode overrides it.
+        for (url, pgsslmode, accepted) in [
+            ("postgres://db.internal:5432/x", "prefer", false),
+            ("postgres://db.internal:5432/x", "require", false),
+            ("postgres://db.internal:5432/x", "disable", true),
+            (
+                "postgres://db.internal:5432/x?sslmode=disable",
+                "require",
+                true,
+            ),
+        ] {
+            let cfg = DbConfig::from_env(env(&[("DATABASE_URL", url), ("PGSSLMODE", pgsslmode)]))
+                .unwrap();
+            assert_eq!(
+                cfg.pg_options().is_ok(),
+                accepted,
+                "{url} with PGSSLMODE={pgsslmode}"
+            );
         }
     }
 

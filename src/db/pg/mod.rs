@@ -142,13 +142,26 @@ async fn first_gate(read: PgPool, status: watch::Sender<Status>) {
     }
 }
 
-/// D: the database's schema version, 0 before any migration ran.
+/// D: the database's schema version, 0 before any migration ran. The table
+/// is looked up on its own first: a statement that names a missing table
+/// fails whatever its `WHERE` says.
 pub(crate) async fn schema_version(read: &PgPool) -> Result<i64> {
+    let versioned = q::try_query_opt(
+        read,
+        "schema_version",
+        "SELECT to_regclass('schema_migrations') IS NOT NULL",
+        |q| q,
+        |r| sqlx::Row::try_get::<bool, _>(r, 0),
+    )
+    .await
+    .context("look up schema_migrations")?;
+    if versioned != Some(true) {
+        return Ok(0);
+    }
     let row = q::try_query_opt(
         read,
         "schema_version",
-        "SELECT COALESCE((SELECT MAX(version) FROM schema_migrations), 0) \
-         WHERE to_regclass('schema_migrations') IS NOT NULL",
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
         |q| q,
         |r| sqlx::Row::try_get::<i64, _>(r, 0),
     )
