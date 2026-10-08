@@ -152,6 +152,10 @@ async fn the_frontier_read_fails_rather_than_reading_empty() {
     assert_eq!(min, None);
     assert!(failed, "the degraded read is flagged for a 503");
     assert!(db::try_min_block_number(&web).await.is_err());
+    assert!(
+        db::tokens_missing_metadata(&web).await.is_err(),
+        "the missing-metadata scan fails too, so the job scans again"
+    );
 }
 
 /// The manifests' shape: DATABASE_URL names the server and nothing else, and

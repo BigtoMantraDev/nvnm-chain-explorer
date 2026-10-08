@@ -995,10 +995,60 @@ async fn missing_metadata_pass<F, Fut>(
     }
 }
 
+/// The missing-metadata job's full scan, until one reads. A failed read is
+/// not "nothing is missing": tokens an earlier run left unfetched would wait
+/// for a restart, or for a bundle that names them again. Retries back off
+/// from one pass to five minutes, since a scan that fails may have run to its
+/// statement timeout; the passes go on meanwhile.
+struct FullScan {
+    done: bool,
+    backoff: Duration,
+    next: tokio::time::Instant,
+}
+
+impl FullScan {
+    fn new() -> Self {
+        FullScan {
+            done: false,
+            backoff: Duration::ZERO,
+            next: tokio::time::Instant::now(),
+        }
+    }
+
+    /// The scan's addresses the first time `read` succeeds; empty before
+    /// that, while it backs off, and after.
+    async fn take<F, Fut>(&mut self, read: F, pass: Duration) -> Vec<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<String>>>,
+    {
+        if self.done || tokio::time::Instant::now() < self.next {
+            return Vec::new();
+        }
+        match read().await {
+            Ok(missing) => {
+                self.done = true;
+                missing
+            }
+            Err(e) => {
+                let cap = Duration::from_secs(300).max(pass);
+                self.backoff = (self.backoff * 2).max(pass).min(cap);
+                self.next = tokio::time::Instant::now() + self.backoff;
+                warn!(
+                    "missing-metadata scan failed; retrying in {:?}: {e:#}",
+                    self.backoff
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// Under `ROLE=indexer`, web replicas write no chain data, so a token whose
 /// metadata fetch failed while indexing has no page view to repair it. This
-/// job does: a full scan once at start, then, on each stats interval, the
-/// addresses committed bundles named that have no metadata.
+/// job does: a full scan at start, retried until it reads, then, on each
+/// stats interval, the addresses committed bundles named that have no
+/// metadata.
 async fn missing_metadata_loop(
     rpc: ChainRpc,
     db: Db,
@@ -1010,10 +1060,13 @@ async fn missing_metadata_loop(
         async move { fetch_token_metadata(&rpc, &addr).await }
     };
     let mut retry = HashSet::new();
-    let mut candidates = db::tokens_missing_metadata(&db).await;
+    let mut scan = FullScan::new();
     loop {
+        let mut candidates = scan
+            .take(|| db::tokens_missing_metadata(&db), interval)
+            .await;
         candidates.extend(db::take_tokens_without_metadata(&db));
-        missing_metadata_pass(&db, std::mem::take(&mut candidates), &mut retry, &fetch).await;
+        missing_metadata_pass(&db, candidates, &mut retry, &fetch).await;
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
         }
@@ -1262,6 +1315,30 @@ mod tests {
             currency: String::new(),
             total_supply: "0".into(),
         }
+    }
+
+    /// A failed scan is not "nothing is missing": it runs again once its
+    /// backoff has passed, and once one reads, no pass rescans.
+    #[tokio::test]
+    async fn a_failed_missing_metadata_scan_is_retried() {
+        let token = checksum_address("0x20c0000000000000000000000000000000000001");
+        // An outage, or a scan past its statement timeout.
+        let fails = || async { Err::<Vec<String>, _>(anyhow::anyhow!("statement timeout")) };
+        let reads = || {
+            let token = token.clone();
+            async move { Ok(vec![token]) }
+        };
+        let pass = Duration::from_secs(5);
+        let mut scan = FullScan::new();
+        assert!(scan.take(fails, pass).await.is_empty());
+        assert!(!scan.done, "a failed scan runs again");
+        assert!(
+            scan.take(reads, pass).await.is_empty(),
+            "not before its backoff has passed"
+        );
+        scan.next = tokio::time::Instant::now();
+        assert_eq!(scan.take(reads, pass).await, vec![token.clone()]);
+        assert!(scan.take(reads, pass).await.is_empty(), "scanned once");
     }
 
     /// One pass saves what it can fetch and keeps the rest for the next pass;

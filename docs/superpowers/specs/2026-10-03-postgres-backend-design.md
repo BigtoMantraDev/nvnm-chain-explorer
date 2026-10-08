@@ -1144,16 +1144,18 @@ each case:
   - The indexer creates rows for tokens it sees in a transfer or as a fee
     token (`attach_token_metadata`, `indexer.rs:268-295`).
   - Its new **missing-metadata job** runs only under `ROLE=indexer`. At
-    startup it runs `tokens_missing_metadata` once, as a full scan. After
-    that, each pass on the stats interval checks only the addresses that
-    `take_tokens_without_metadata` returns: token addresses that bundles
-    committed since the last pass referenced and that the token-label
-    cache has no entry for (section 3). So no pass rescans `transactions`
-    (`fee_token` has no index). The job fetches the missing tokens and
-    saves them through the writer. An address whose fetch fails stays in
-    the job's own retry set and is tried again on the next pass. That
-    covers fetches that failed during indexing, which a page view used to
-    repair. Under `ROLE=all`, page views still repair them, as today.
+    startup it runs `tokens_missing_metadata` as a full scan. A failed scan
+    is not "none missing": it runs again, backing off from one pass to five
+    minutes, until one reads. Besides the scan, each pass on the stats
+    interval checks only the addresses that `take_tokens_without_metadata`
+    returns: token addresses that bundles committed since the last pass
+    referenced and that the token-label cache has no entry for (section 3).
+    So once the scan has read, no pass rescans `transactions` (`fee_token`
+    has no index). The job fetches the missing tokens and saves them through
+    the writer. An address whose fetch fails stays in the job's own retry
+    set and is tried again on the next pass. That covers fetches that failed
+    during indexing, which a page view used to repair. Under `ROLE=all`,
+    page views still repair them, as today.
   - `repair_token_metadata` only re-fetches existing rows
     (`indexer.rs:611-620`).
 - **Split-mode divergence (accepted; see "Known limitations").** Under

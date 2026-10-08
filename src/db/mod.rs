@@ -151,7 +151,8 @@ async fn reseed_until_ok(weak: Weak<Inner>, wait_first: bool) {
 /// deletes `token_metadata` rows.
 ///
 /// Under `ROLE=indexer` it also notes the token addresses committed bundles
-/// name with no entry, for the missing-metadata job.
+/// name with no entry, for the missing-metadata job. Whatever takes both locks
+/// takes `labels` first.
 struct LabelCache {
     labels: RwLock<HashMap<String, String>>,
     noted: Option<Mutex<HashSet<String>>>,
@@ -224,8 +225,10 @@ impl LabelCache {
         let Some(noted) = &self.noted else {
             return Vec::new();
         };
-        let mut noted = noted.lock().unwrap_or_else(|e| e.into_inner());
+        // The labels before `noted`, as `committed` takes them: the other way
+        // round deadlocks against a commit.
         let map = self.labels.read().unwrap_or_else(|e| e.into_inner());
+        let mut noted = noted.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<String> = noted.drain().filter(|a| !map.contains_key(a)).collect();
         out.sort();
         out
@@ -379,7 +382,7 @@ db_fn! {
     inline   fn compute_and_store_stats() -> Result<Value>;
     blocking fn repair_derived_tables();
     extra    fn try_min_block_number() -> Result<Option<i64>>;
-    extra    fn tokens_missing_metadata() -> Vec<String>;
+    extra    fn tokens_missing_metadata() -> Result<Vec<String>>;
     extra    fn try_all_token_metas() -> Result<Vec<TokenMetadata>>;
 }
 
@@ -566,6 +569,30 @@ pub mod coverage {
 mod tests {
     use super::*;
     use crate::decoder::checksum_address;
+
+    /// `committed` holds the labels' write lock while it takes `noted`. Were
+    /// `take_noted` to hold `noted` while it waits on the labels, a commit and
+    /// the missing-metadata job would deadlock.
+    #[test]
+    fn take_noted_never_holds_noted_while_a_commit_holds_the_labels() {
+        let cache = LabelCache::new(true);
+        std::thread::scope(|s| {
+            // Where `committed` stands before it takes `noted`.
+            let labels = cache.write();
+            let job = s.spawn(|| cache.take_noted());
+            let noted = cache.noted.as_ref().unwrap();
+            let until = std::time::Instant::now() + Duration::from_millis(200);
+            while std::time::Instant::now() < until {
+                assert!(
+                    !matches!(noted.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+                    "take_noted holds `noted` while it waits on the labels"
+                );
+                std::thread::yield_now();
+            }
+            drop(labels);
+            assert!(job.join().unwrap().is_empty());
+        });
+    }
 
     const A: &str = "0x5555555555555555555555555555555555555501";
     const B: &str = "0x5555555555555555555555555555555555555502";

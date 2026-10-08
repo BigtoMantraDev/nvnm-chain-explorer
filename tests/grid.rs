@@ -163,21 +163,10 @@ fn tie_aware(pages: &[Vec<Value>], key: impl Fn(&Value) -> Value) -> Value {
     json!({"keys": keys, "rows": all})
 }
 
-/// The stats blob, wall-clock fields left out and floats rounded to a
-/// relative 1e-9.
+/// The stats blob, wall-clock fields left out. Its floats stay numbers, which
+/// `agree` compares within a relative 1e-9.
 fn stats(v: &Value) -> Value {
-    let mut out = BTreeMap::new();
-    for (k, x) in v.as_object().unwrap() {
-        if k == "updated_at" {
-            continue;
-        }
-        let x = match x.as_f64() {
-            Some(f) if x.is_f64() => json!(format!("{:.9e}", f)),
-            _ => x.clone(),
-        };
-        out.insert(k.clone(), x);
-    }
-    json!(out)
+    without_clock(v.clone())
 }
 
 /// Wall-clock fields, which differ between any two writes, dropped wherever
@@ -425,7 +414,7 @@ async fn answers(db: &Db) -> BTreeMap<String, Value> {
     );
     put(
         "tokens_missing_metadata",
-        sorted(&db::tokens_missing_metadata(db).await),
+        sorted(&db::tokens_missing_metadata(db).await.unwrap()),
     );
     put(
         "compute_and_store_stats",
@@ -535,7 +524,7 @@ async fn every_function_answers_the_same_on_both_backends() {
     let (a, b) = (answers(&sqlite).await, answers(&pg).await);
     let mut differ = Vec::new();
     for (call, va) in &a {
-        if b.get(call) != Some(va) {
+        if b.get(call).is_none_or(|vb| !agree(va, vb)) {
             differ.push(format!(
                 "{call}:\n    SQLite   {}\n    Postgres {}",
                 truncate(va),
@@ -556,6 +545,41 @@ async fn every_function_answers_the_same_on_both_backends() {
         let missed: Vec<&&str> = db::ALL_FNS.iter().filter(|f| !hit.contains(**f)).collect();
         assert!(missed.is_empty(), "never ran on both backends: {missed:?}");
     }
+}
+
+/// Whether two answers agree: floats within a relative 1e-9, everything else
+/// exactly. Only the stats carry floats, and SQLite's SUM compensates while
+/// Postgres's does not, so `gas_util_pct` can differ in its last bits.
+fn agree(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) if x.is_f64() && y.is_f64() => {
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            (x - y).abs() <= 1e-9 * x.abs().max(y.abs())
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| agree(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| agree(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+/// The grid's comparison, no database needed: a float within a relative 1e-9
+/// agrees even across a rounding boundary, and nothing else is loosened.
+#[test]
+fn stats_agree_within_a_relative_1e_9() {
+    let sqlite = stats(&json!({"gas_util_pct": 1.00000000049, "total_blocks": 5, "updated_at": 1}));
+    let pg = |gas: f64, blocks: i64| {
+        stats(&json!({"gas_util_pct": gas, "total_blocks": blocks, "updated_at": 2}))
+    };
+    // 2e-11 apart, but either side of the tenth significant digit.
+    assert!(agree(&sqlite, &pg(1.00000000051, 5)));
+    // 1.5e-9 apart: past the tolerance.
+    assert!(!agree(&sqlite, &pg(1.000000002, 5)));
+    // Integers stay exact.
+    assert!(!agree(&sqlite, &pg(1.00000000049, 6)));
 }
 
 fn truncate(v: &Value) -> String {

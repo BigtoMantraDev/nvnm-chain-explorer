@@ -293,9 +293,10 @@ pub(crate) async fn get_address_holdings(p: &PgDb, address: &str) -> Vec<Value> 
 }
 
 /// Token addresses a transfer or a fee references with no metadata row, for
-/// the missing-metadata job's first pass.
-pub(crate) async fn tokens_missing_metadata(p: &PgDb) -> Vec<String> {
-    q::query_rows(
+/// the missing-metadata job's scan, or why they could not be read: a failed
+/// scan is not "none missing".
+pub(crate) async fn tokens_missing_metadata(p: &PgDb) -> anyhow::Result<Vec<String>> {
+    Ok(q::try_query_rows(
         &p.read,
         "tokens_missing_metadata",
         "SELECT a FROM (
@@ -307,5 +308,5 @@ pub(crate) async fn tokens_missing_metadata(p: &PgDb) -> Vec<String> {
         |q| q,
         |r| Ok(blob_addr(&r.try_get::<Vec<u8>, _>(0)?)),
     )
-    .await
+    .await?)
 }
