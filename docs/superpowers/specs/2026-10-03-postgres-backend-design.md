@@ -206,7 +206,7 @@ becomes the fallback.
 | `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), header parsing, checksums, the web schema gate                                                                                                                                                                                                                  | ~150             |
 | `src/db/pg/mod.rs`                                        | `PgDb`, pools, the version floor, session settings, `DbError` and its classifier, `DB_FAILED`, preflight                                                                                                                                                                                                               | ~350             |
 | `src/db/pg/writer.rs`                                     | Candidate loop, lock and self-checks, spawned and cancel-safe `with_txn`, budgets, watchdog, lease, `writer_seq`, leadership watch                                                                                                                                                                                     | ~380             |
-| `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `fetch_one`, `fetch_all`, `exec`, `exec_best_effort`, all with client deadlines; statement counter                                                                                                                                        | ~170             |
+| `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `exec_best_effort`, and the writer's `run`, `exec`, `fetch_all` and `raw`, all with client deadlines; statement counter                                                                                                                   | ~170             |
 | `src/db/pg/shared.rs`                                     | Copies of `hex_blob`, `blob_hex`, `blob_addr`, `bigint`; column-list macros; the `HOLDING` text                                                                                                                                                                                                                        | ~70              |
 | `src/db/pg/{blocks,txs,tokens,transfers,kv,selectors}.rs` | Read SQL and row mappers                                                                                                                                                                                                                                                                                               | ~1,200           |
 | `src/db/pg/plan.rs`                                       | Pure batch planner: dedup, net balance deltas, holder deltas. Dropped if stage 4b falls back to the per-row writer                                                                                                                                                                                                     | ~200             |
@@ -972,9 +972,9 @@ runs `SELECT pg_try_advisory_lock(K1, K_WRITER)` (5 s timeout).
   preflight; a grant that fails for any reason but a missing role is
   `Unavailable`. The self-checks are:
   - `SELECT NOT pg_is_in_recovery()`. A replica, such as the Kubernetes
-    `-ro` Service or a read-replica address, is treated as `Unavailable`.
-    If it is still in recovery after the 120 s window, the process exits
-    with a message naming that likely misconfiguration;
+    `-ro` Service or a read-replica address, is a misconfiguration that
+    waiting cannot fix: the process exits with code 1 at once, with a
+    message naming it;
   - `pg_locks` holds exactly one granted advisory row with
     `pid = pg_backend_pid()` and `objsubid = 2`.
 
@@ -995,7 +995,10 @@ runs `SELECT pg_try_advisory_lock(K1, K_WRITER)` (5 s timeout).
 pub async fn write<T: Send + 'static>(&self, budget: Budget, f: impl TxFn<T>) -> Result<T, DbError> {
     let this = self.clone();
     // A dropped caller only drops the JoinHandle: the transaction runs to completion.
-    tokio::spawn(async move { this.write_retrying(budget, f).await }).await.map_err(DbError::from)?
+    match tokio::spawn(async move { this.write_retrying(budget, f).await }).await {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e.into_panic()), // never cancelled: nothing aborts it
+    }
 }
 
 // inside write_retrying, per attempt:
@@ -1047,8 +1050,7 @@ caller.
 | Condition                                                                                                                                                                                                                                        | Class         | What happens                                                                                                                                                                                                                                   |
 |--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | SQLSTATE classes `22` and `23`, `21000` (cardinality violation), sqlx `Error::Encode`                                                                                                                                                            | `Data`        | Returned to the caller. These depend on a bundle's content, so `indexer.rs:1024-1036`'s per-bundle fallback isolates the bad bundle                                                                                                            |
-| `40001`, `40P01`                                                                                                                                                                                                                                 | Retry         | Retried immediately                                                                                                                                                                                                                            |
-| **Everything else:** `08*`, `57P0x`, `55P03`, `57014` (escalates once to `Long`), `25006`, classes `42`, `53`, `54`, `58`, `XX`, I/O errors, pool and client timeouts, and every other sqlx error (`Protocol`, `Tls`, `Decode`, `PoolClosed`, …) | `Unavailable` | `Writer::write` drops the session and retries the same idempotent batch, with backoff from 1 s to 30 s. It logs a warning with the SQLSTATE on each retry, and an error after 10 identical failures. It never returns this class to the caller |
+| **Everything else:** `08*`, `57P0x`, `55P03`, `57014` (escalates once to `Long`), `25006`, classes `42`, `53`, `54`, `58`, `XX`, I/O errors, pool and client timeouts, and every other sqlx error (`Protocol`, `Tls`, `Decode`, `PoolClosed`, …) | `Unavailable` | `Writer::write` drops the session and retries the same idempotent batch, with backoff from 1 s to 30 s. It logs a warning with the SQLSTATE on each retry. It never returns this class to the caller                                           |
 
 A database problem, such as a timeout, a full disk, a missing privilege or
 a restart, therefore never drops blocks. Dropped blocks would be a

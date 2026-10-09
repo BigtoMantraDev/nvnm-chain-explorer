@@ -130,14 +130,12 @@ pub(crate) async fn run(conn: &mut PgConnection, web_role: &str) -> Result<(), D
     )
     .await
     .map_err(|e| unavailable("create schema_migrations", e))?;
-    let db: i64 = q::fetch_one(
-        conn,
+    let db: i64 = q::run(
         "schema version",
-        sqlx::query("SELECT COALESCE(MAX(version), 0) FROM schema_migrations"),
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+            .fetch_one(&mut *conn),
     )
     .await
-    .map_err(|e| unavailable("read the schema version", e))?
-    .try_get(0)
     .map_err(|e| unavailable("read the schema version", e))?;
     // The writer re-runs the preflight under the lock, so D <= B here.
     let pending = usize::try_from(db)

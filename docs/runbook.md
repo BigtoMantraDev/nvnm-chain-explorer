@@ -66,7 +66,7 @@ After the switch, every release rolls `explorer-indexer` first, then
 
 | Code | Meaning                                                    | What to do                                                                 |
 |------|------------------------------------------------------------|----------------------------------------------------------------------------|
-| 1    | The preflight refused the database, or the config is wrong, including a `DATABASE_URL` that points at a replica (the server stayed in recovery for 120 s) | Read the log line; see "Preflight refusals" below                          |
+| 1    | The preflight refused the database, or the config is wrong, including a `DATABASE_URL` that points at a replica (the server is in recovery) | Read the log line; see "Preflight refusals" below                          |
 | 3    | Leadership lost: another session held the lock for 120 s   | Another writer holds the lock. Normal during a rollout; otherwise look for a second indexer |
 | 4    | The database is not at this process's `writer_seq`         | Commits were lost (a restore, or a crash with `synchronous_commit=off`). The restart re-derives them; nothing to do |
 | 5    | An indexer core task ended                                 | The pod restarts; read the log for why                                     |

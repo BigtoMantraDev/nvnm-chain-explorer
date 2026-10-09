@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use num_bigint::BigInt;
-use sqlx::{PgConnection, Row};
+use sqlx::PgConnection;
 
 use super::plan::{apply_deltas, BalanceChanges, BatchPlan};
-use super::q::{self, PgQuery};
+use super::q::{exec, fetch_all, get, PgQuery};
 use super::shared::{bigint, hex_blob, without_nul};
-use super::writer::{timed, Budget, TxFuture};
+use super::writer::{Budget, TxFuture};
 use super::{DbError, PgDb};
 use crate::db::{now_ts, Holder};
 use crate::models::{AnchoringEvent, Block, BlockBundle, Transaction};
@@ -246,25 +246,6 @@ fn anchoring_query(events: &[AnchoringEvent]) -> PgQuery {
                 .map(|e| hex_blob(&e.caller))
                 .collect::<Vec<_>>(),
         )
-}
-
-async fn exec(c: &mut PgConnection, what: &str, query: PgQuery) -> Result<u64, DbError> {
-    timed(what, q::exec(c, what, query)).await
-}
-
-async fn fetch_all(
-    c: &mut PgConnection,
-    what: &str,
-    query: PgQuery,
-) -> Result<Vec<sqlx::postgres::PgRow>, DbError> {
-    timed(what, q::fetch_all(c, what, query)).await
-}
-
-fn get<T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>>(
-    row: &sqlx::postgres::PgRow,
-    i: usize,
-) -> Result<T, DbError> {
-    row.try_get(i).map_err(|e| DbError::from_sqlx("decode", e))
 }
 
 /// The stored balances of `keys`.

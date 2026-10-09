@@ -48,10 +48,10 @@ cluster (an operator such as CloudNativePG). PostgreSQL 15 or later.
 | Credentials         | Password users; `PGPASSWORD` from Secret Manager through a synced Secret                               | The operator-generated Secret's `username` and `password`                                                      |
 | Not usable          | Managed Connection Pooling and the Auth Proxy: transaction pooling forbids session locks, and a proxy hides a dead client | The same, for the same reasons                                                                                 |
 
-The writer refuses a replica: a session that is in recovery is treated as
-unavailable and retried, and after 120 s the indexer exits with code 1,
-naming the likely misconfiguration. An unreachable database is never a
-reason to exit: the indexer waits for it, however long it takes.
+The writer refuses a replica: a session that is in recovery makes the
+indexer exit with code 1 at once, naming the likely misconfiguration. An
+unreachable database is never a reason to exit: the indexer waits for it,
+however long it takes.
 
 **No TLS.** The explorer's Postgres client is built without TLS: every
 connection is plaintext, so the database must be reachable only over a
