@@ -24,10 +24,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value as Sql;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use sqlx::postgres::{PgArguments, PgConnection, Postgres};
 use sqlx::query::Query;
 use sqlx::{
@@ -35,11 +34,17 @@ use sqlx::{
     Statement as _, TypeInfo as _,
 };
 
+#[path = "common/backend.rs"]
+mod backend;
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, diff_rows, pg_rows, row_key, rows, tables, to_json, Spec, SPECS};
+use common::baseline::{
+    columns, diff_rows, fixture_paths, open_fixture, pg_rows, quoted, row_key, rows, tables,
+    to_json, Spec, SPECS,
+};
 
 use nvnmchain_explorer::db::migrations::{binary_version, Migration, MIGRATIONS};
+use nvnmchain_explorer::db::{self, Role};
 
 /// The baseline, version 1.
 const SCHEMA: &str = include_str!("../migrations/postgres/0001_baseline.sql");
@@ -112,12 +117,6 @@ const HERE: &str = "(SELECT oid FROM pg_namespace WHERE nspname = current_schema
 // A scratch schema per test
 // ---------------------------------------------------------------------------
 
-/// A connection whose `search_path` is a fresh schema of the test's own.
-struct Scratch {
-    conn: PgConnection,
-    schema: String,
-}
-
 fn pg_error(e: &sqlx::Error) -> String {
     match e.as_database_error() {
         Some(db) => format!("{} ({})", db.message(), db.code().unwrap_or_default()),
@@ -125,71 +124,43 @@ fn pg_error(e: &sqlx::Error) -> String {
     }
 }
 
-/// Set up schema `t_<test>_<pid>`, dropping what an earlier failed run left.
-async fn scratch(test: &str) -> Scratch {
-    let url = std::env::var("PG_TEST_URL").unwrap_or_else(|_| {
-        panic!(
-            "PG_TEST_URL is not set; point it at a Postgres server, e.g. after \
-             `docker compose up -d --wait` (see AGENTS.md)"
-        )
-    });
-    let mut conn = PgConnection::connect(&url)
+/// A fresh schema of the test's own, its URL, and a connection to it. Keep
+/// the guard alive: it drops the schema once the test passes.
+async fn scratch() -> (backend::Scratch, String, PgConnection) {
+    let (guard, url) = backend::scratch_schema().await;
+    let conn = PgConnection::connect(&url)
         .await
-        .unwrap_or_else(|e| panic!("connect to PG_TEST_URL: {}", pg_error(&e)));
-    let schema = format!("t_{test}_{}", std::process::id());
-    sqlx::raw_sql(AssertSqlSafe(format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
-         SET search_path TO {schema}"
-    )))
-    .execute(&mut conn)
-    .await
-    .unwrap_or_else(|e| panic!("set up schema {schema}: {}", pg_error(&e)));
-    Scratch { conn, schema }
+        .unwrap_or_else(|e| panic!("connect to the scratch schema: {}", pg_error(&e)));
+    (guard, url, conn)
 }
 
-impl Scratch {
-    async fn apply_schema(&mut self) {
-        sqlx::raw_sql(SCHEMA)
-            .execute(&mut self.conn)
-            .await
-            .unwrap_or_else(|e| panic!("apply 0001_baseline.sql: {}", pg_error(&e)));
-    }
-
-    /// Apply the Postgres files of versions `from..=to`, in order.
-    async fn apply_versions(&mut self, from: i64, to: i64) {
-        for m in MIGRATIONS
-            .iter()
-            .filter(|m| (from..=to).contains(&m.version))
-        {
-            self.apply(m).await;
-        }
-    }
-
-    /// Apply one version's Postgres file as the runner does: in a
-    /// transaction.
-    async fn apply(&mut self, m: &Migration) {
-        let failed = |e: sqlx::Error| -> ! {
-            panic!("apply {:04}_{}.sql: {}", m.version, m.name, pg_error(&e))
-        };
-        let mut tx = self.conn.begin().await.unwrap_or_else(|e| failed(e));
-        sqlx::raw_sql(AssertSqlSafe(m.postgres))
-            .execute(&mut *tx)
-            .await
-            .unwrap_or_else(|e| failed(e));
-        tx.commit().await.unwrap_or_else(|e| failed(e));
-    }
-
-    /// Drop the schema. Only a passing test calls this, so a failed one
-    /// leaves its tables to inspect.
-    async fn finish(mut self) {
-        sqlx::raw_sql(AssertSqlSafe(format!(
-            "DROP SCHEMA {} CASCADE",
-            self.schema
-        )))
-        .execute(&mut self.conn)
+async fn apply_schema(conn: &mut PgConnection) {
+    sqlx::raw_sql(SCHEMA)
+        .execute(conn)
         .await
-        .unwrap_or_else(|e| panic!("drop schema {}: {}", self.schema, pg_error(&e)));
+        .unwrap_or_else(|e| panic!("apply 0001_baseline.sql: {}", pg_error(&e)));
+}
+
+/// Apply the Postgres files of versions `from..=to`, in order.
+async fn apply_versions(conn: &mut PgConnection, from: i64, to: i64) {
+    for m in MIGRATIONS
+        .iter()
+        .filter(|m| (from..=to).contains(&m.version))
+    {
+        apply(conn, m).await;
     }
+}
+
+/// Apply one version's Postgres file as the runner does: in a transaction.
+async fn apply(conn: &mut PgConnection, m: &Migration) {
+    let failed =
+        |e: sqlx::Error| -> ! { panic!("apply {:04}_{}.sql: {}", m.version, m.name, pg_error(&e)) };
+    let mut tx = conn.begin().await.unwrap_or_else(|e| failed(e));
+    sqlx::raw_sql(AssertSqlSafe(m.postgres))
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|e| failed(e));
+    tx.commit().await.unwrap_or_else(|e| failed(e));
 }
 
 // ---------------------------------------------------------------------------
@@ -226,43 +197,32 @@ async fn catalog(conn: &mut PgConnection) -> Vec<String> {
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn the_schema_version_is_0_before_any_migration() {
-    use nvnmchain_explorer::db::{DbConfig, DbUrl, Role, Status};
-    let mut pg = scratch("schema_version").await;
-    let base = std::env::var("PG_TEST_URL").unwrap();
-    let sep = if base.contains('?') { '&' } else { '?' };
-    let url = format!("{base}{sep}options[search_path]={}", pg.schema);
-    let db = nvnmchain_explorer::db::open_with(
-        &DbConfig::postgres(DbUrl(url), Role::Web),
-        tokio::sync::watch::channel(Status::starting(Role::Web)).0,
-    )
-    .await
-    .unwrap_or_else(|e| panic!("open {}: {e:#}", pg.schema));
-    let version = nvnmchain_explorer::db::schema_version(&db).await;
+    let (_scratch, url, mut conn) = scratch().await;
+    let db = backend::open(&backend::pg_config(&url, Role::Web)).await;
+    let version = db::schema_version(&db).await;
     assert_eq!(version.map_err(|e| format!("{e:#}")), Ok(0));
 
-    pg.apply_schema().await;
+    apply_schema(&mut conn).await;
     sqlx::raw_sql(
         "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY); \
          INSERT INTO schema_migrations VALUES (1)",
     )
-    .execute(&mut pg.conn)
+    .execute(&mut conn)
     .await
     .unwrap_or_else(|e| panic!("stamp version 1: {}", pg_error(&e)));
-    let version = nvnmchain_explorer::db::schema_version(&db).await;
+    let version = db::schema_version(&db).await;
     assert_eq!(version.map_err(|e| format!("{e:#}")), Ok(1));
-    pg.finish().await;
 }
 
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn applying_the_schema_twice_changes_nothing() {
-    let mut pg = scratch("idempotence").await;
-    pg.apply_schema().await;
-    let once = catalog(&mut pg.conn).await;
+    let (_scratch, _, mut conn) = scratch().await;
+    apply_schema(&mut conn).await;
+    let once = catalog(&mut conn).await;
     assert!(!once.is_empty(), "0001_baseline.sql created nothing");
-    pg.apply_schema().await;
-    assert_eq!(catalog(&mut pg.conn).await, once);
-    pg.finish().await;
+    apply_schema(&mut conn).await;
+    assert_eq!(catalog(&mut conn).await, once);
 }
 
 // ---------------------------------------------------------------------------
@@ -826,16 +786,16 @@ async fn every_version_has_the_same_shape_on_both_backends() {
     for n in 1..=binary_version() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parity.db");
-        let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).unwrap();
+        let conn = db::init_db(path.to_str().unwrap()).unwrap();
         for m in MIGRATIONS.iter().filter(|m| (2..=n).contains(&m.version)) {
             conn.execute_batch(m.sqlite.expect("a SQLite twin"))
                 .unwrap_or_else(|e| panic!("apply sqlite {:04}_{}.sql: {e}", m.version, m.name));
         }
         let sqlite = sqlite_shape(&conn);
 
-        let mut pg = scratch(&format!("parity_{n}")).await;
-        pg.apply_versions(1, n).await;
-        let postgres = pg_shape(&mut pg.conn).await;
+        let (_scratch, _, mut pg) = scratch().await;
+        apply_versions(&mut pg, 1, n).await;
+        let postgres = pg_shape(&mut pg).await;
         let diffs = compare(&sqlite, &postgres);
 
         let allowed: Vec<_> = ALLOWED.iter().filter(|a| a.6 <= n).collect();
@@ -858,14 +818,13 @@ async fn every_version_has_the_same_shape_on_both_backends() {
             }
         }
         problems.extend(untranslated(&sqlite, &postgres, TRANSLATED, n));
-        problems.extend(uncollated(&mut pg.conn).await);
+        problems.extend(uncollated(&mut pg).await);
         assert!(
             problems.is_empty(),
             "version {n}: SQLite and Postgres differ; fix the migration pair using the type \
              rules in docs/superpowers/specs/2026-10-02-schema-two-dialects-design.md:\n{}",
             problems.join("\n")
         );
-        pg.finish().await;
     }
 }
 
@@ -873,41 +832,12 @@ async fn every_version_has_the_same_shape_on_both_backends() {
 // Baseline round-trip
 // ---------------------------------------------------------------------------
 
-fn fixtures() -> Vec<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/baseline");
-    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "db"))
-        .collect();
-    found.sort();
-    assert!(!found.is_empty(), "no baselines under {}", dir.display());
-    found
-}
-
-/// A fixture, read-only and immutable, as `tests/baseline.rs` opens it.
-fn open_fixture(path: &Path) -> Connection {
-    let abs = std::fs::canonicalize(path).unwrap();
-    Connection::open_with_flags(
-        format!("file:{}?immutable=1", abs.display()),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
-}
-
 fn spec(table: &str) -> &'static Spec {
     SPECS
         .iter()
         .chain(UNINDEXED)
         .find(|s| s.table == table)
         .unwrap_or_else(|| panic!("{table}: no row key; add it to UNINDEXED in tests/postgres.rs"))
-}
-
-fn quoted(cols: &[String]) -> String {
-    cols.iter()
-        .map(|c| format!("\"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 type PgQuery<'q> = Query<'q, Postgres, PgArguments>;
@@ -996,15 +926,11 @@ async fn copy_table(
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn every_baseline_round_trips_through_postgres() {
     let mut failed = Vec::new();
-    for path in fixtures() {
-        let stem = path
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .replace('-', "_");
-        let mut pg = scratch(&format!("roundtrip_{stem}")).await;
-        pg.apply_schema().await;
+    // A failing fixture's schema, kept to inspect.
+    let mut kept = Vec::new();
+    for path in fixture_paths() {
+        let (guard, _, mut pg) = scratch().await;
+        apply_schema(&mut pg).await;
         let sqlite = open_fixture(&path);
 
         let mut copied = Vec::new();
@@ -1013,12 +939,12 @@ async fn every_baseline_round_trips_through_postgres() {
             .filter(|t| t != "sqlite_sequence")
         {
             let cols = columns(&sqlite, &table);
-            let n = copy_table(&mut pg.conn, &sqlite, &table, &cols).await;
+            let n = copy_table(&mut pg, &sqlite, &table, &cols).await;
             copied.push((table, cols, n));
         }
         // The data upgrade: every later version applies over the copied rows,
         // and they read back unchanged.
-        pg.apply_versions(2, binary_version()).await;
+        apply_versions(&mut pg, 2, binary_version()).await;
 
         let mut diffs = Vec::new();
         for (table, cols, n) in &copied {
@@ -1026,7 +952,7 @@ async fn every_baseline_round_trips_through_postgres() {
             let spec = spec(table);
             let (base, back) = (
                 rows(&sqlite, spec, cols),
-                pg_rows(&mut pg.conn, spec, cols).await,
+                pg_rows(&mut pg, spec, cols).await,
             );
             assert_eq!(base.len(), n, "{table}: duplicate row keys in the fixture");
             diffs.extend(diff_rows(table, &base, &back, ("fixture", "Postgres copy")));
@@ -1034,13 +960,12 @@ async fn every_baseline_round_trips_through_postgres() {
 
         let total: usize = copied.iter().map(|c| c.2).sum();
         eprintln!("{}: {total} row(s) copied", path.display());
-        if diffs.is_empty() {
-            pg.finish().await;
-        } else {
+        if !diffs.is_empty() {
             for d in diffs.iter().take(25) {
                 eprintln!("  {d}");
             }
             failed.push(format!("{}: {} difference(s)", path.display(), diffs.len()));
+            kept.push(guard);
         }
     }
     assert!(failed.is_empty(), "round-trip differs: {failed:?}");

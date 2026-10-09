@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 #[path = "common/backend.rs"]
 mod backend;
+use backend::exec;
 
 fn fast(url: &str, role: Role) -> DbConfig {
     let mut cfg = backend::pg_config(url, role);
@@ -56,20 +57,10 @@ fn bundle(number: i64) -> BlockBundle {
     }
 }
 
-async fn admin(url: &str) -> PgConnection {
-    PgConnection::connect(url).await.expect("connect")
-}
-
-async fn exec(url: &str, sql: &str) {
-    sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
-        .execute(&mut admin(url).await)
-        .await
-        .unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
-
 async fn count(url: &str, sql: &str) -> i64 {
+    let mut conn = PgConnection::connect(url).await.expect("connect");
     sqlx::query(AssertSqlSafe(sql.to_string()))
-        .fetch_one(&mut admin(url).await)
+        .fetch_one(&mut conn)
         .await
         .unwrap()
         .get(0)

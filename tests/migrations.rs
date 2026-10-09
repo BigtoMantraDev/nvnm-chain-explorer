@@ -13,7 +13,7 @@ use rusqlite::{Connection, OpenFlags};
 
 #[allow(dead_code)]
 mod common;
-use common::baseline::{columns, tables};
+use common::baseline::{columns, quoted, tables};
 
 /// A value as stored, its storage class included: a rewrite to equal-looking
 /// text or JSON still shows.
@@ -35,13 +35,8 @@ fn contents(
 ) -> BTreeMap<String, Vec<String>> {
     let mut out = BTreeMap::new();
     for (table, cols) in cols {
-        let list = cols
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
         let mut stmt = conn
-            .prepare(&format!("SELECT {list} FROM \"{table}\""))
+            .prepare(&format!("SELECT {} FROM \"{table}\"", quoted(cols)))
             .unwrap();
         let mut rows: Vec<String> = stmt
             .query_map([], |r| {
@@ -155,15 +150,7 @@ mod backend;
 use std::time::Duration;
 
 use nvnmchain_explorer::db::{DbConfig, Role, Status};
-use sqlx::{AssertSqlSafe, Connection as _, PgConnection};
-
-async fn pg_exec(url: &str, sql: &str) {
-    let mut conn = PgConnection::connect(url).await.unwrap();
-    sqlx::raw_sql(AssertSqlSafe(sql.to_string()))
-        .execute(&mut conn)
-        .await
-        .unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
+use sqlx::{Connection as _, PgConnection};
 
 fn indexer(url: &str) -> DbConfig {
     let mut cfg = backend::pg_config(url, Role::Indexer);
@@ -189,15 +176,8 @@ async fn refusal(cfg: &DbConfig) -> String {
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn an_edited_postgres_migration_is_refused() {
     let (_scratch, url) = backend::scratch_schema().await;
-    drop(
-        db::open_with(
-            &indexer(&url),
-            tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-        )
-        .await
-        .unwrap(),
-    );
-    pg_exec(
+    drop(backend::open(&indexer(&url)).await);
+    backend::exec(
         &url,
         "UPDATE schema_migrations SET checksum = 'x' WHERE version = 1",
     )
@@ -214,14 +194,9 @@ async fn an_edited_postgres_migration_is_refused() {
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn a_newer_postgres_database_is_refused_before_the_lock() {
     let (_scratch, url) = backend::scratch_schema().await;
-    let leader = db::open_with(
-        &indexer(&url),
-        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-    )
-    .await
-    .unwrap();
+    let leader = backend::open(&indexer(&url)).await;
     let newer = db::migrations::binary_version() + 1;
-    pg_exec(
+    backend::exec(
         &url,
         &format!("INSERT INTO schema_migrations VALUES ({newer}, 'later', 'x', 0, 'test')"),
     )
@@ -235,7 +210,7 @@ async fn a_newer_postgres_database_is_refused_before_the_lock() {
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn a_schema_applied_by_hand_is_refused() {
     let (_scratch, url) = backend::scratch_schema().await;
-    pg_exec(
+    backend::exec(
         &url,
         include_str!("../migrations/postgres/0001_baseline.sql"),
     )
@@ -250,19 +225,14 @@ async fn a_schema_applied_by_hand_is_refused() {
 async fn the_web_role_reads_and_writes_only_the_caches() {
     let (_scratch, url) = backend::scratch_schema().await;
     let role = format!("t_web_{}", std::process::id());
-    pg_exec(
+    backend::exec(
         &url,
         &format!("DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'pw'"),
     )
     .await;
     let mut cfg = indexer(&url);
     cfg.web_role = role.clone();
-    let writer = db::open_with(
-        &cfg,
-        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-    )
-    .await
-    .unwrap();
+    let writer = backend::open(&cfg).await;
     let block = nvnmchain_explorer::models::Block {
         number: 1,
         hash: format!("0x{:064x}", 1),
@@ -286,12 +256,7 @@ async fn the_web_role_reads_and_writes_only_the_caches() {
     let mut as_web = url::Url::parse(&url).unwrap();
     as_web.set_username(&role).unwrap();
     as_web.set_password(Some("pw")).unwrap();
-    let web = db::open_with(
-        &backend::pg_config(as_web.as_str(), Role::Web),
-        tokio::sync::watch::channel(Status::starting(Role::Web)).0,
-    )
-    .await
-    .unwrap();
+    let web = backend::open(&backend::pg_config(as_web.as_str(), Role::Web)).await;
     assert_eq!(db::get_latest_block(&web).await.map(|b| b.number), Some(1));
     db::save_selector_names(&web, &[("0x12345678".into(), "f()".into())])
         .await
@@ -314,12 +279,12 @@ async fn the_web_role_reads_and_writes_only_the_caches() {
         Some("42501")
     );
     // A cache write that fails is logged and never makes the page a 503.
-    pg_exec(&url, &format!("REVOKE UPDATE ON transactions FROM {role}")).await;
+    backend::exec(&url, &format!("REVOKE UPDATE ON transactions FROM {role}")).await;
     let (written, failed) =
         db::track_failures(db::set_trace(&web, &format!("0x{:064x}", 9), "{}")).await;
     assert!(written.is_err(), "the write was refused");
     assert!(!failed, "a cache write never sets the 503 flag");
 
     drop((web, writer));
-    pg_exec(&url, &format!("DROP OWNED BY {role}; DROP ROLE {role}")).await;
+    backend::exec(&url, &format!("DROP OWNED BY {role}; DROP ROLE {role}")).await;
 }

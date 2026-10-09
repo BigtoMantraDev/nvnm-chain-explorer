@@ -258,8 +258,7 @@ URL to match. The Postgres tests are `#[ignore]`d so plain `cargo test` needs
 no server, and with `--include-ignored` but no `PG_TEST_URL` they fail rather
 than skip. Each test works in a schema of its own, dropped when it passes and
 kept to inspect when it fails. The next run sweeps the `t_<pid>_<n>` ones whose
-process is gone; `tests/postgres.rs` names its own `t_<test>_<pid>`, which
-are dropped by hand. The compose file starts Postgres with `max_connections=300`,
+process is gone. The compose file starts Postgres with `max_connections=300`,
 since every test opens pools of its own.
 
 CI runs the same in `.github/workflows/postgres.yml`, against PostgreSQL 18
