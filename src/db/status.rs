@@ -40,7 +40,7 @@ pub enum Preflight {
 
 /// How far the indexer has come, read from what its loops last saw, never
 /// from the database.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Sync {
     pub lowest_block: Option<i64>,
     pub tip_lag: Option<i64>,
