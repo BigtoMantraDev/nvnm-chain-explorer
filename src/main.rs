@@ -20,12 +20,22 @@ use nvnmchain_explorer::{metrics, web};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Local development: settings from `.env`, or the file `ENV_FILE` names
+    // (an empty one reads none); a variable already set wins. Deployments set
+    // the environment themselves and have no `.env`.
+    let env_file =
+        dotenvy::from_filename(std::env::var("ENV_FILE").unwrap_or_else(|_| ".env".into()));
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "nvnmchain_explorer=info".into()),
         )
         .init();
+    match env_file {
+        Ok(path) => info!("read settings from {}", path.display()),
+        Err(e) if !e.not_found() => warn!("settings file: {e}"),
+        Err(_) => {}
+    }
 
     let cfg = Settings::from_env();
     let db_cfg =

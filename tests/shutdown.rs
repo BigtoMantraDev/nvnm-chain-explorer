@@ -4,6 +4,9 @@
 //! exited by then loses its session mid-batch anyway. The binary runs against a
 //! node that accepts connections and never answers, so a page view and the
 //! indexer are both stuck in an RPC call when the signal arrives.
+//!
+//! Each explorer starts with `ENV_FILE` empty, so a `.env` in the checkout
+//! cannot change it.
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
@@ -117,6 +120,7 @@ fn sigterm_exits_within_three_seconds_with_a_request_in_flight() {
     let port = free_port();
     let mut child = Explorer(
         Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+            .env("ENV_FILE", "")
             .env("DB_PATH", dir.path().join("shutdown.db"))
             .env("HOST", "127.0.0.1")
             .env("PORT", port.to_string())
@@ -204,6 +208,7 @@ fn a_sigterm_during_startup_stops_it_cleanly() {
         let sigterm = Sigterm::ready();
         let mut child = Explorer(
             Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+                .env("ENV_FILE", "")
                 .env("DB_PATH", dir.path().join("startup.db"))
                 .env("HOST", "127.0.0.1")
                 .env("PORT", port.to_string())
@@ -275,6 +280,7 @@ fn the_port_answers_before_the_database_opens() {
     let node = silent_node();
     let _child = Explorer(
         Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+            .env("ENV_FILE", "")
             .env("ROLE", "indexer")
             .env(
                 "DATABASE_URL",
@@ -309,6 +315,7 @@ fn sigterm_exits_within_three_seconds_with_the_runtime_stuck_in_sqlite() {
     let port = free_port();
     let mut child = Explorer(
         Command::new(env!("CARGO_BIN_EXE_nvnmchain-explorer"))
+            .env("ENV_FILE", "")
             .env("DB_PATH", &path)
             .env("TOKIO_WORKER_THREADS", "1")
             .env("STATS_INTERVAL_SECONDS", "1")
