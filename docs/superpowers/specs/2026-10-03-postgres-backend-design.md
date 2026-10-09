@@ -657,7 +657,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ### Checksums and immutability
 
 - **Checksum of a file:** sha3-256 of its `include_str!` text, with CRLF
-  normalized, computed when the process starts.
+  normalized, computed when the runner or the preflight checks it.
 - **SQLite v1's checksum:** the constant `BASELINE_SHA3`. It is the sha3 of
   `SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name`
   over `init_db(":memory:")`.

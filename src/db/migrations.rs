@@ -7,8 +7,8 @@
 //! Version numbers are assigned on NVNM-Chain's `main` only (docs/database.md).
 
 use std::collections::HashSet;
-use std::sync::LazyLock;
 
+use anyhow::bail;
 use sha3::{Digest, Sha3_256};
 
 /// One schema version. `sqlite` is `None` for version 1, which is `init_db`.
@@ -51,16 +51,6 @@ migrations! {
     0001 => "baseline";
 }
 
-/// The first version a database's rows skip, and the version found in its
-/// place. The runners record versions in order, so a gap means hand edits.
-pub fn first_gap(applied: impl IntoIterator<Item = i64>) -> Option<(i64, i64)> {
-    applied
-        .into_iter()
-        .zip(1..)
-        .find(|(have, want)| have != want)
-        .map(|(have, want)| (want, have))
-}
-
 /// B: the newest version this binary knows.
 pub fn binary_version() -> i64 {
     MIGRATIONS.last().map_or(0, |m| m.version)
@@ -72,18 +62,45 @@ pub fn checksum(text: &str) -> String {
     hex::encode(Sha3_256::digest(text.replace("\r\n", "\n").as_bytes()))
 }
 
-/// Each version's Postgres checksum, computed once per process.
-pub fn postgres_checksums() -> &'static [String] {
-    static SUMS: LazyLock<Vec<String>> =
-        LazyLock::new(|| MIGRATIONS.iter().map(|m| checksum(m.postgres)).collect());
-    &SUMS
-}
-
 /// Whether a web replica may serve a database at version `db`: once the
 /// indexer has applied every migration this binary knows.
 pub fn web_ready(db: i64) -> bool {
     db >= binary_version()
 }
+
+/// Check a database's applied versions, `(version, checksum)` in order,
+/// against this binary's list, `sum` giving each file's expected checksum, and
+/// return D. The runners record versions in order, so a gap means hand edits.
+pub(crate) fn check_applied(
+    applied: &[(i64, String)],
+    sum: impl Fn(&Migration) -> String,
+) -> anyhow::Result<i64> {
+    for ((v, _), want) in applied.iter().zip(1..) {
+        if *v != want {
+            bail!(
+                "schema_migrations has version {v} but not {want}: its rows were edited by \
+                 hand, so which files ran is unknown"
+            );
+        }
+    }
+    let db = applied.len() as i64;
+    let binary = binary_version();
+    if db > binary {
+        bail!(
+            "the database is at schema version {db}, newer than this binary's {binary}; \
+             deploy a release at version {db} or later (the only way back is forward)"
+        );
+    }
+    for ((v, stored), m) in applied.iter().zip(MIGRATIONS) {
+        if *stored != sum(m) {
+            bail!("migration {v} was edited after it was applied");
+        }
+    }
+    Ok(db)
+}
+
+/// Who applied a version, for the `applied_by` column.
+pub(crate) const APPLIED_BY: &str = concat!("nvnmchain-explorer ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -468,15 +485,6 @@ pub fn check_list(list: &[Migration]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn first_gap_names_the_first_skipped_version() {
-        assert_eq!(first_gap([]), None);
-        assert_eq!(first_gap([1, 2, 3]), None);
-        assert_eq!(first_gap([1, 3]), Some((2, 3)));
-        assert_eq!(first_gap([2]), Some((1, 2)));
-        assert_eq!(first_gap([1, 2, 4, 5]), Some((3, 4)));
-    }
 
     const EXPAND: &str = "-- kind: expand\n";
 

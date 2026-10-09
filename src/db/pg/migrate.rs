@@ -7,12 +7,10 @@ use super::q;
 use super::DbError;
 use crate::db::config::is_identifier;
 use crate::db::migrations::{
-    binary_version, checksum, concurrent_indexes, first_gap, headers, postgres_checksums,
-    split_at_line_end, Migration, MIGRATIONS,
+    binary_version, check_applied, checksum, concurrent_indexes, headers, split_at_line_end,
+    Migration, APPLIED_BY, MIGRATIONS,
 };
 use crate::db::now_ts;
-
-const APPLIED_BY: &str = concat!("nvnmchain-explorer ", env!("CARGO_PKG_VERSION"));
 
 pub(crate) enum PreflightError {
     /// The database is not one this binary may write: the process exits.
@@ -60,29 +58,7 @@ pub(crate) async fn preflight(conn: &mut PgConnection) -> Result<(), PreflightEr
             .iter()
             .map(|r| Ok((r.try_get(0)?, r.try_get(1)?)))
             .collect::<Result<_, sqlx::Error>>()?;
-    if let Some((missing, found)) = first_gap(applied.iter().map(|(v, _)| *v)) {
-        return Err(PreflightError::Refused(anyhow!(
-            "schema_migrations has version {found} but not {missing}: its rows were edited by \
-             hand, so which files ran is unknown. Drop the schema and re-index from the chain"
-        )));
-    }
-    let binary = binary_version();
-    let db = applied.last().map_or(0, |(v, _)| *v);
-    if db > binary {
-        return Err(PreflightError::Refused(anyhow!(
-            "the database is at schema version {db}, newer than this binary's {binary}; \
-             deploy a release at version {db} or later (the only way back is forward)"
-        )));
-    }
-    let sums = postgres_checksums();
-    for (version, stored) in &applied {
-        let expected = usize::try_from(*version - 1).ok().and_then(|i| sums.get(i));
-        if expected != Some(stored) {
-            return Err(PreflightError::Refused(anyhow!(
-                "migration {version} was edited after it was applied"
-            )));
-        }
-    }
+    let db = check_applied(&applied, |m| checksum(m.postgres)).map_err(PreflightError::Refused)?;
     let rebuilding: Vec<String> = MIGRATIONS[db as usize..]
         .iter()
         .filter(|m| headers(m.postgres).0.no_transaction)
