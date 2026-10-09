@@ -1354,8 +1354,7 @@ flowchart LR
   when:
   - **indexer:** the preflight passed, whether the writer is a candidate,
     leader or reacquiring. Sync progress never affects readiness;
-  - **web:** the schema gate (D ≥ B) passed, and no shutdown signal has
-    arrived.
+  - **web:** the schema gate (D ≥ B) passed.
 
   Database health shows in the JSON body and in metrics. Pool exhaustion
   and outages are handled by the 503 middleware, not by readiness.

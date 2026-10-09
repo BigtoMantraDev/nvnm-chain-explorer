@@ -91,8 +91,8 @@ pod about 10. Keep the HPA's `maxReplicas × 10 + 12` within the server's
   restarts nothing. The port answers before the database opens.
 - **Readiness** is `/readyz`. It reads the status the process publishes and
   never takes a connection. The indexer is Ready once its preflight passed;
-  a web pod once the schema gate passed and no shutdown has begun. Its body
-  says why: `{role, schema: {db, binary}, writer, preflight, sync}`.
+  a web pod once the schema gate passed. Its body says why:
+  `{role, schema: {db, binary}, writer, preflight, sync}`.
 - **Shutdown** takes at most 3 s after SIGTERM. Web pods sleep 10 s in
   `preStop` first, so the endpoints drop them before they stop accepting.
 
