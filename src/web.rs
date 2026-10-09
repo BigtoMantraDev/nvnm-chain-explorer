@@ -934,10 +934,7 @@ pub async fn block_page(
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
     // Looked up rather than inferred from the tip: the index has gaps while it
     // backfills, so a number below the tip is not necessarily there to link to.
-    let neighbour = |n: i64| {
-        let db = state.db.clone();
-        async move { db::get_block_by_number(&db, n).await }
-    };
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n);
     let below = if block.number > 0 {
         neighbour(block.number - 1).await
     } else {
@@ -2428,15 +2425,13 @@ async fn readyz(State(h): State<HealthState>) -> Response {
 /// Turn a response whose reads failed into a 503 with `Retry-After`, never a
 /// false 404 or an empty page, and time every page by its route.
 async fn database_guard(
-    matched: Option<axum::extract::MatchedPath>,
+    matched: axum::extract::MatchedPath,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let started = std::time::Instant::now();
     let (resp, failed) = db::track_failures(next.run(req)).await;
-    if let Some(route) = matched {
-        crate::metrics::request_duration(route.as_str(), started.elapsed().as_secs_f64());
-    }
+    crate::metrics::request_duration(matched.as_str(), started.elapsed().as_secs_f64());
     if !failed {
         return resp;
     }
