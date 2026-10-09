@@ -39,9 +39,7 @@ use sqlx::{
 mod common;
 use common::baseline::{columns, diff_rows, pg_rows, row_key, rows, tables, to_json, Spec, SPECS};
 
-use nvnmchain_explorer::db::migrations::{
-    binary_version, check_pair, headers, split_at_line_end, Migration, MIGRATIONS,
-};
+use nvnmchain_explorer::db::migrations::{binary_version, Migration, MIGRATIONS};
 
 /// The baseline, version 1.
 const SCHEMA: &str = include_str!("../migrations/postgres/0001_baseline.sql");
@@ -167,29 +165,18 @@ impl Scratch {
         }
     }
 
-    /// Apply one version's Postgres file as the runner does: a
-    /// `-- no-transaction` one a query at a time, split where the runner
-    /// splits it (one multi-statement query is an implicit transaction, which
-    /// `CONCURRENTLY` refuses), any other in a transaction.
+    /// Apply one version's Postgres file as the runner does: in a
+    /// transaction.
     async fn apply(&mut self, m: &Migration) {
         let failed = |e: sqlx::Error| -> ! {
             panic!("apply {:04}_{}.sql: {}", m.version, m.name, pg_error(&e))
         };
-        if headers(m.postgres).0.no_transaction {
-            for query in split_at_line_end(m.postgres) {
-                sqlx::raw_sql(AssertSqlSafe(query))
-                    .execute(&mut self.conn)
-                    .await
-                    .unwrap_or_else(|e| failed(e));
-            }
-        } else {
-            let mut tx = self.conn.begin().await.unwrap_or_else(|e| failed(e));
-            sqlx::raw_sql(AssertSqlSafe(m.postgres))
-                .execute(&mut *tx)
-                .await
-                .unwrap_or_else(|e| failed(e));
-            tx.commit().await.unwrap_or_else(|e| failed(e));
-        }
+        let mut tx = self.conn.begin().await.unwrap_or_else(|e| failed(e));
+        sqlx::raw_sql(AssertSqlSafe(m.postgres))
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| failed(e));
+        tx.commit().await.unwrap_or_else(|e| failed(e));
     }
 
     /// Drop the schema. Only a passing test calls this, so a failed one
@@ -275,36 +262,6 @@ async fn applying_the_schema_twice_changes_nothing() {
     assert!(!once.is_empty(), "0001_baseline.sql created nothing");
     pg.apply_schema().await;
     assert_eq!(catalog(&mut pg.conn).await, once);
-    pg.finish().await;
-}
-
-/// A `-- no-transaction` file the rules accept, here one rebuilding an index,
-/// applies as it would in production.
-#[tokio::test]
-#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
-async fn a_no_transaction_file_applies() {
-    let rebuild = Migration {
-        version: 2,
-        name: "rebuild",
-        sqlite: Some("-- kind: expand\n-- noop: postgres-only\n"),
-        postgres: "-- kind: expand\n-- no-transaction\n\
-                   DROP INDEX CONCURRENTLY IF EXISTS idx_blocks_miner_v2;\n\
-                   CREATE INDEX CONCURRENTLY idx_blocks_miner_v2 ON blocks (miner);\n",
-    };
-    let rules = check_pair(2, rebuild.name, rebuild.sqlite.unwrap(), rebuild.postgres);
-    assert_eq!(rules, Vec::<String>::new());
-    let mut pg = scratch("no_transaction").await;
-    pg.apply_schema().await;
-    pg.apply(&rebuild).await;
-    let built: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_indexes
-                        WHERE schemaname = current_schema()
-                          AND indexname = 'idx_blocks_miner_v2')",
-    )
-    .fetch_one(&mut pg.conn)
-    .await
-    .unwrap();
-    assert!(built, "the index was not built");
     pg.finish().await;
 }
 

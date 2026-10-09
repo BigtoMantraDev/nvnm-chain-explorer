@@ -244,47 +244,6 @@ async fn a_schema_applied_by_hand_is_refused() {
     assert!(err.contains("no schema_migrations"), "{err}");
 }
 
-/// An index a failed concurrent build left INVALID is refused, unless
-/// `REINDEX CONCURRENTLY` is building it.
-#[tokio::test]
-#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
-async fn an_invalid_index_is_refused() {
-    let (_scratch, url) = backend::scratch_schema().await;
-    drop(
-        db::open_with(
-            &indexer(&url),
-            tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-        )
-        .await
-        .unwrap(),
-    );
-    pg_exec(
-        &url,
-        "INSERT INTO kv (key, value) VALUES ('a', 'same'), ('b', 'same');
-         UPDATE pg_index SET indisvalid = false
-         WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'idx_blocks_timestamp'
-                             AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()))",
-    )
-    .await;
-    let err = refusal(&indexer(&url)).await;
-    assert!(
-        err.contains("INVALID") && err.contains("idx_blocks_timestamp"),
-        "{err}"
-    );
-
-    pg_exec(
-        &url,
-        "ALTER INDEX idx_blocks_timestamp RENAME TO idx_blocks_timestamp_ccnew",
-    )
-    .await;
-    db::open_with(
-        &indexer(&url),
-        tokio::sync::watch::channel(Status::starting(Role::Indexer)).0,
-    )
-    .await
-    .expect("a REINDEX CONCURRENTLY in progress does not block a start");
-}
-
 /// Web replicas read everything and write only the two caches.
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]

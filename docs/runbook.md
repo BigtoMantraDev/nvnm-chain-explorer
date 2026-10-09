@@ -88,10 +88,6 @@ it waited, and exits 1 the same way:
   never change.
 - **"newer than this binary"** (D > B): an older image against a migrated
   database. Roll forward.
-- **"INVALID index(es)"**: a concurrent index build was interrupted outside a
-  migration. Drop the index with `DROP INDEX CONCURRENTLY` and run the
-  migration's `CREATE` again. A `REINDEX CONCURRENTLY` in progress
-  (`*_ccnew`, `*_ccold`) never blocks a start.
 
 ## Database restarts and maintenance
 

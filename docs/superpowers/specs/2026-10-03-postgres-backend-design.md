@@ -203,7 +203,7 @@ becomes the fallback.
 | `src/db/indexer_jobs.rs`, `src/db/schema_check.rs`        | Unchanged paths, loaded through `#[path]` from `sqlite.rs`                                                                                                                                                                                                                                                             | section 4        |
 | `src/db/sqlite/migrate.rs`                                | SQLite runner (v1 = `init_db`), shape hash, `init_db` pins, commute guard                                                                                                                                                                                                                                              | ~160             |
 | `src/db/sqlite/extra.rs`                                  | New SQLite queries, which never edit existing ones (e.g. `tokens_missing_metadata`)                                                                                                                                                                                                                                    | ~40              |
-| `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), header parsing, checksums, the web schema gate                                                                                                                                                                                                                  | ~150             |
+| `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), checksums, the applied-version checks, the web schema gate                                                                                                                                                                                                      | ~150             |
 | `src/db/pg/mod.rs`                                        | `PgDb`, pools, the version floor, session settings, `DbError` and its classifier, `DB_FAILED`, preflight                                                                                                                                                                                                               | ~350             |
 | `src/db/pg/writer.rs`                                     | Candidate loop, lock and self-checks, spawned and cancel-safe `with_txn`, budgets, watchdog, lease, `writer_seq`, leadership watch                                                                                                                                                                                     | ~380             |
 | `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `exec_best_effort`, and the writer's `run`, `exec`, `fetch_all` and `raw`, all with client deadlines; statement counter                                                                                                                   | ~170             |
@@ -617,30 +617,14 @@ grid proves the copies agree.
 - **From 0002 on, every version is a twin pair**
   (`migrations/sqlite/NNNN_name.sql` and `migrations/postgres/NNNN_name.sql`),
   with the same number and name.
-- **Headers:**
-  - `-- kind: expand|contract`: required, and equal in both twins.
-  - `-- no-transaction`: Postgres only (rules below).
-  - `-- noop: sqlite-only` or `-- noop: postgres-only`: for a backend with
-    nothing to do.
-- **A header test checks:** contiguous, unique versions, twin pairing,
-  matching kinds and well-formed headers. It also enforces the
-  no-transaction rules and forbids, in transactional Postgres files,
-  `DROP INDEX` without `CONCURRENTLY` and `CREATE INDEX` without
-  `CONCURRENTLY` on `transactions` and `transfer_events`.
-- **It checks the bodies of `expand` files** in both dialects, so `kind`
-  means something:
-  - an expand file may not contain `DROP TABLE`, `DROP COLUMN`, `RENAME`,
-    `SET NOT NULL`, `ALTER COLUMN`, `TRUNCATE` or `DELETE FROM`;
-  - it may use `ADD CONSTRAINT`, `UNIQUE`, `CHECK` or `REFERENCES` only on
-    a table the same file creates, in its `CREATE TABLE` or in a
-    `CREATE [UNIQUE] INDEX` on it;
-  - it may not `DROP INDEX x` unless the same file then re-creates `x`;
-  - the check matches whole keywords and skips `--` comment lines.
-
-  These operations must therefore be labelled `contract`, and so follow
-  the contract rule in "Version skew and deploy order" below: a contract
-  ships one release after the code stops using the object, and its PR
-  names that release.
+- **A list test checks** contiguous, unique versions, and that every file
+  on disk is in the list. The `migrations!` macro pairs the twins: a missing
+  file does not compile.
+- **No headers.** Files are plain SQL; a twin with nothing to do is empty.
+  Stage 2 shipped `-- kind: expand|contract` with an expand-body check,
+  `-- noop:` and `-- no-transaction` headers. No migration used them, so they
+  were dropped; the expand/contract rule is left to review ("Version skew and
+  deploy order" below).
 
 **Table** (the same on both backends, with INTEGER types on SQLite):
 
@@ -687,7 +671,7 @@ numbers:
   allowed: the CI immutability step protects only files already on the
   base branch.
 - **NVNM-Chain's `main` requires a PR to be up to date before it merges,**
-  with the header test as a required check, so that test always runs
+  with the list test as a required check, so that test always runs
   against the latest numbers. Without it, two PRs that each add a `0003`
   under different names pass their own CI and clash only on `main`, where
   `docker.yml` has already built an image from the clash. Today the org
@@ -762,9 +746,9 @@ A guard test checks every N: temp file → `init_db` → 0002..N → hash →
 
 | Change                                 | SQLite twin                                                                                                                                                                                                                    | Postgres twin                                                                                                                                                                                                                       |
 |----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| New table, column or index             | As usual. `init_db`'s `IF NOT EXISTS` ignores objects it does not know                                                                                                                                                         | As usual. A new index is a no-transaction CIC file                                                                                                                                                                                  |
-| Re-keyed index: two releases, new name | **Expand N:** `CREATE INDEX x_v2 ON t(new key)`; queries move to the new key. **Contract N+1:** `DROP INDEX x; CREATE INDEX x ON t(col) WHERE 0` (an empty stub that costs nothing per insert, and that `IF NOT EXISTS` skips) | **Expand N:** no-transaction `DROP INDEX CONCURRENTLY IF EXISTS x_v2; CREATE INDEX CONCURRENTLY x_v2 …`. **Contract N+1:** no-transaction `DROP INDEX CONCURRENTLY IF EXISTS x`. Postgres never has a window without a usable index |
-| Retired index                          | The stub, as above                                                                                                                                                                                                             | `DROP INDEX CONCURRENTLY IF EXISTS x`                                                                                                                                                                                               |
+| New table, column or index             | As usual. `init_db`'s `IF NOT EXISTS` ignores objects it does not know                                                                                                                                                         | As usual, in one transaction                                                                                                                                                                                                        |
+| Re-keyed index: two releases, new name | **Expand N:** `CREATE INDEX x_v2 ON t(new key)`; queries move to the new key. **Contract N+1:** `DROP INDEX x; CREATE INDEX x ON t(col) WHERE 0` (an empty stub that costs nothing per insert, and that `IF NOT EXISTS` skips) | **Expand N:** `CREATE INDEX x_v2 ON t(new key)`. **Contract N+1:** `DROP INDEX x`. Postgres never has a window without a usable index                                                                                               |
+| Retired index                          | The stub, as above                                                                                                                                                                                                             | `DROP INDEX x`                                                                                                                                                                                                                      |
 | Re-keyed derived table                 | `DROP TABLE t; CREATE TABLE t (…)`, recreate `init_db`'s index names on it (stubs where needed), and `DELETE FROM kv WHERE key = '…'` for its watermark                                                                        | The same, in one transaction                                                                                                                                                                                                        |
 | Retired table                          | `DELETE FROM t`, plus stub indexes                                                                                                                                                                                             | `DROP TABLE t`                                                                                                                                                                                                                      |
 
@@ -793,46 +777,32 @@ runner, since a newer release may have migrated while it waited:
   unknown. The remedy is the same;
 - a checksum mismatch;
 - D > B. There is no override: rolling back across a migration means
-  rolling forward;
-- an index left INVALID, where `pg_index.indisvalid = false`. Two kinds
-  are excluded:
-  - indexes named `%_ccnew` and `%_ccold`, so a DBA's
-    `REINDEX CONCURRENTLY` cannot block a start;
-  - indexes created by a `-- no-transaction` file whose version is not yet
-    in `schema_migrations`. The preflight reads their names from the file's
-    `CREATE INDEX CONCURRENTLY` lines, which the header test constrains. A
-    restart during that file's CREATE leaves its index INVALID, and the
-    runner drops and rebuilds it when it re-runs the file. Refusing it
-    would stop the indexer from ever reaching that re-run.
+  rolling forward.
 
-**Transactional files** run as:
+Stage 4a also refused an index left INVALID. Only an interrupted concurrent
+build leaves one, which no migration runs any more (below), so the refusal
+was dropped with the no-transaction files.
+
+**Every file** runs as one transaction:
 
 1. `BEGIN; SET LOCAL statement_timeout = 0; SET LOCAL lock_timeout = '5s'`;
 2. the body;
 3. the version row;
 4. `COMMIT`.
 
-A `55P03` (lock timeout) is retried up to 5 times.
+Any failure, a `55P03` (lock timeout) included, is `Unavailable`: the
+writer drops the session and runs the preflight and the runner again on a
+new one, backing off from 1 s to 30 s between tries. The rolled-back file
+re-runs from the top.
 
-**`-- no-transaction` files:**
-
-- **Allowed statements:** only `DROP INDEX CONCURRENTLY IF EXISTS …` and
-  `CREATE [UNIQUE] INDEX CONCURRENTLY …`. Every `CREATE … CONCURRENTLY x`
-  must come after a `DROP INDEX CONCURRENTLY IF EXISTS x` in the same
-  file. Never write `IF NOT EXISTS`, because it would hide an INVALID index.
-- **How the runner executes them:**
-  1. On the writer session, outside `with_txn`, it sets
-     `SET statement_timeout = 0` and `SET lock_timeout = '5s'`.
-  2. It runs each statement as its own autocommit `execute`, split at a `;`
-     at line end, with no `$$` bodies. One multi-statement query would form
-     an implicit transaction block, which `CONCURRENTLY` refuses.
-  3. It inserts the version row only after the last statement succeeds.
-  4. It `RESET`s both settings.
-- **Supervision:** the `Long` watchdog, with no client timeout.
-- **Recovery:** re-running the file after any interruption restarts from
-  its DROP. That covers a kill during the CREATE, and a crash after the
-  CREATE but before the row is written. A `55P03` or `57014` is retried by
-  re-running the whole file.
+**No concurrent index builds.** Stage 4a also ran `-- no-transaction` files
+of `CREATE INDEX CONCURRENTLY`, a statement at a time. No migration used
+them, so they were dropped; they come back with the first migration that
+needs one. A plain `CREATE INDEX` blocks writes to its table but not reads,
+so web replicas keep serving while it builds, and the writer runs no chain
+writes until the runner finishes. A file must never pair a long index
+build with a statement that takes `ACCESS EXCLUSIVE` (`DROP INDEX`,
+`ALTER TABLE`, …), which would block reads for the whole build.
 
 **Grants.** After migrations, the runner re-applies the web role's grants
 on every start. GRANT is idempotent, so this also restores grants lost when
@@ -851,9 +821,9 @@ database-wide, and it returns without unlocking on error
 | Indexer | D > B                  | refuses at preflight |
 | Web     | any                    | ready when D ≥ B     |
 
-- **What `expand` allows** is what the expand-body check lets through
-  (section 5, "The model"). A new column must also be nullable or have a
-  default. The check cannot see that, so the PR review does.
+- **What `expand` allows** is decided in PR review: it adds, and a new
+  column is nullable or has a default. Anything that removes or rewrites
+  what the code uses is a contract.
 - **When a `contract` ships.** One release after the code stops using the
   object, and the PR names that release. The previous release's web
   replicas then never touch what the contract removes. A re-keyed derived
@@ -1042,7 +1012,7 @@ match &r {
 | Budget  | Used for                                                                             | Limits                                                                                                                                                                                                              |
 |---------|--------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `Batch` | Normal writes                                                                        | Each statement gets a client timeout of `statement_timeout + 10 s` = 70 s, so the server cancels first and the error is clean                                                                                       |
-| `Long`  | Migrations (including no-transaction files), repairs, rebuilds, `sync_holder_counts` | `statement_timeout = 0` and no client timeout. A watchdog checks every 15 s, from the read pool and with a 5 s deadline, that `pg_locks` still shows the writer pid holding `K_WRITER`. Four misses cancel the work |
+| `Long`  | Migrations, repairs, rebuilds, `sync_holder_counts`                                  | `statement_timeout = 0` and no client timeout. A watchdog checks every 15 s, from the read pool and with a 5 s deadline, that `pg_locks` still shows the writer pid holding `K_WRITER`. Four misses cancel the work |
 
 **Error classes.** `Unavailable` is the default; only `Data` reaches the
 caller.
@@ -1608,12 +1578,7 @@ which serves as the reference, and through `BatchPlan`. Balances and
 - both canaries adopted with their rows intact;
 - checksum refusal, and D > B refusal by the preflight before `try_lock`;
 - per-version shape parity, and a per-version data upgrade;
-- a no-transaction file killed during the CREATE, and again between the
-  CREATE and the row insert, then re-run successfully with
-  `indisvalid = true`. The kill takes down the whole process, so each
-  re-run goes through a fresh start and its preflight;
-- the invalid-index refusal, the header rules including the expand-body
-  check, and the web gate (D ≥ B);
+- the list test, and the web gate (D ≥ B);
 - an unversioned Postgres schema refused;
 - the web role's grants.
 
@@ -1913,10 +1878,10 @@ backends always compile, so clippy always checks both.
 | Blocks lost on a database restart or error, or after a restore | `Unavailable` is the default class and is retried; `writer_seq` with run id and exit 4; fallible frontier reads; the container-restart and injected-error tests                                                                                                                                                                                                                                                 |
 | The database is a single point of failure (no HA)              | Pages return 503 with `Retry-After` while it is down, and no block is lost (section 6). If the data itself is lost, a re-index rebuilds it at the rate item 7 measures: at ~200 blocks/s, about 3 h for the ~2.3M blocks of 2026-10-05, plus about 15 min for each day the chain grows. Pages show partial history until backfill completes (section 10). HA can be added later with no code change (section 7) |
 | Orphan sessions holding the lock                               | The lease, `tcp_user_timeout`, `client_connection_check_interval`, terminating the recorded pid, and the watchdog                                                                                                                                                                                                                                                                                               |
-| A deploy deadlock, a broken image, or version skew             | Probes never wait on the lock; the indexer preflight gates readiness; the expand-body check and the one-release contract rule; indexer-first deploys                                                                                                                                                                                                                                                            |
+| A deploy deadlock, a broken image, or version skew             | Probes never wait on the lock; the indexer preflight gates readiness; the one-release contract rule, checked in review; indexer-first deploys                                                                                                                                                                                                                                                                   |
 | A divergence that only production data shows                   | Section 9's tests (replay, differential, the live canary re-index, the grid); the cutover's hole check and spot check; the current deployment kept for 7 days as the fallback                                                                                                                                                                                                                                   |
 | Teammates edit `init_db` or a merged migration                 | Pins A and B; the CI immutability step; runtime checksums                                                                                                                                                                                                                                                                                                                                                       |
-| Two repos assign the same migration number                     | Numbers are assigned on NVNM-Chain's `main` only, and other repos sync migrations from it (section 5); the header test as a required, up-to-date check; runtime checksums refuse a mismatch                                                                                                                                                                                                                     |
+| Two repos assign the same migration number                     | Numbers are assigned on NVNM-Chain's `main` only, and other repos sync migrations from it (section 5); the list test as a required, up-to-date check; runtime checksums refuse a mismatch                                                                                                                                                                                                                       |
 | The commute rule proves too restrictive                        | Stub patterns, two-release index changes, and the section 5 escape hatch                                                                                                                                                                                                                                                                                                                                        |
 | sqlx 0.9.0 is new                                              | Pinned to `=0.9.0`; MSRV 1.94                                                                                                                                                                                                                                                                                                                                                                                   |
 
