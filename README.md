@@ -149,13 +149,12 @@ The indexer is built for a sub-second chain:
 
 ## Configuration (env vars)
 
-The explorer reads `.env` from its working directory at startup; `ENV_FILE`
-names another file, and an empty `ENV_FILE` reads none. A variable already set
-in the environment wins over the file, so a secret a deployment injects is
-never replaced; in the file, a later line wins, and a value holding a `$`
-needs single quotes. `.env.example` sets the variables for local
-development, against a local node and the `docker compose` Postgres; copy it
-to `.env`, which git ignores.
+For local development the explorer reads `.env` at startup; `ENV_FILE` names
+another file, and an empty `ENV_FILE` reads none. A variable already set in the
+environment wins over the file, and a value holding a `$` needs single quotes.
+`.env.example` sets the variables for a local node and the `docker compose`
+Postgres; copy it to `.env`, which git ignores. Deployments set the
+environment themselves.
 
 | Var                      | Default                                   | Meaning                                                                                                  |
 |--------------------------|-------------------------------------------|----------------------------------------------------------------------------------------------------------|
