@@ -213,7 +213,8 @@ async fn a_failure_while_reacquiring_is_retried_not_returned() {
 }
 
 /// A write runs on its own task, so a caller that goes away (a closed tab, a
-/// timeout) cannot cut it short.
+/// timeout) cannot cut it short. Its tokens are still labelled: the label
+/// cache is updated by the task that waits for the commit, not by the caller.
 #[tokio::test]
 #[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn a_dropped_caller_does_not_abort_its_batch() {
@@ -222,34 +223,6 @@ async fn a_dropped_caller_does_not_abort_its_batch() {
     db::save_block_bundle(&db, &bundle(1)).await.unwrap();
     let pid = db::testing::writer_pid(&db).unwrap();
     // Slow every block insert, so the caller is gone mid-batch.
-    exec(
-        &url,
-        "CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.05); RETURN NEW; END $$;
-         CREATE TRIGGER slow BEFORE INSERT ON blocks FOR EACH ROW EXECUTE FUNCTION slow();",
-    )
-    .await;
-    let batch: Vec<BlockBundle> = (10..40).map(bundle).collect();
-    let call = db::save_block_bundles(&db, &batch);
-    assert!(tokio::time::timeout(Duration::from_millis(200), call)
-        .await
-        .is_err());
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(
-        count(&url, "SELECT COUNT(*) FROM blocks").await,
-        31,
-        "the batch committed"
-    );
-    assert_eq!(db::testing::writer_pid(&db), Some(pid), "the same session");
-}
-
-/// A dropped caller's batch still labels its tokens: the label cache is
-/// updated by the task that waits for the commit, not by the caller.
-#[tokio::test]
-#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
-async fn a_dropped_callers_batch_still_labels_its_tokens() {
-    let (_scratch, url) = backend::scratch_schema().await;
-    let (db, _status) = open(&fast(&url, Role::Indexer)).await;
     exec(
         &url,
         "CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.05); RETURN NEW; END $$;
@@ -274,9 +247,10 @@ async fn a_dropped_callers_batch_still_labels_its_tokens() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         count(&url, "SELECT COUNT(*) FROM blocks").await,
-        30,
+        31,
         "the batch committed"
     );
+    assert_eq!(db::testing::writer_pid(&db), Some(pid), "the same session");
     assert_eq!(db::token_label(&db, &token).as_deref(), Some("LBL"));
 }
 

@@ -1,8 +1,8 @@
-//! `/healthz` and `/readyz`: what an orchestrator's probes see.
+//! `/readyz`: what an orchestrator's readiness probe sees. It reads the status
+//! the database layer publishes, never a pool connection.
 //!
-//! Liveness never touches the database, so an outage does not restart every
-//! pod. Readiness reads the status the database layer publishes, never a pool
-//! connection.
+//! Liveness, `/healthz`, never touches the database, so an outage does not
+//! restart every pod: `tests/outage.rs` and `tests/shutdown.rs` check it.
 
 use nvnmchain_explorer::db::{self, DbConfig, Role, Status};
 use nvnmchain_explorer::web;
@@ -23,13 +23,6 @@ async fn serve(status: watch::Receiver<Status>) -> String {
 async fn get(base: &str, path: &str) -> (u16, String) {
     let resp = reqwest::get(format!("{base}{path}")).await.expect("GET");
     (resp.status().as_u16(), resp.text().await.expect("body"))
-}
-
-#[tokio::test]
-async fn liveness_needs_no_database() {
-    let (_tx, status) = watch::channel(Status::starting(Role::All));
-    let base = serve(status).await;
-    assert_eq!(get(&base, "/healthz").await, (200, "ok".to_string()));
 }
 
 #[tokio::test]

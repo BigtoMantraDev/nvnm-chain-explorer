@@ -1,8 +1,8 @@
 //! What the indexer leans on in the database under `ROLE=indexer`, and what a
 //! web replica's follower does when a read fails.
 //!
-//! Needs a Postgres server: ignored unless run with `--include-ignored`, and
-//! then failing without `PG_TEST_URL`.
+//! The tests that need a Postgres server are ignored unless run with
+//! `--include-ignored`, and then fail without `PG_TEST_URL`.
 
 use std::sync::{Arc, RwLock};
 
@@ -137,10 +137,7 @@ async fn only_the_indexer_notes() {
 /// Backfill's frontier: an outage must read as an error, never as an empty
 /// table, or backfill would re-walk the chain from the head.
 #[tokio::test]
-#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
 async fn the_frontier_read_fails_rather_than_reading_empty() {
-    let (_scratch, url) = backend::scratch_schema().await;
-    drop(open(&url, Role::Indexer).await);
     // A web replica pointed at a port nothing listens on.
     let web = open(
         "postgres://explorer:explorer@127.0.0.1:1/explorer",
