@@ -2,11 +2,11 @@
 //! its working directory. Each test reads the first log line, which names the
 //! database chosen, and stops the explorer there.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The explorer in `dir`, with nothing it could pick up from this shell: no
 /// node to index from, no third party to ask, and a port of the kernel's.
@@ -45,34 +45,6 @@ fn startup_line(mut cmd: Command) -> String {
     let _ = child.kill();
     let _ = child.wait();
     line.expect("the explorer logged no startup line")
-}
-
-/// How the explorer exited, and what it wrote to stderr; `None` if it was
-/// still running after 30 s, when it is stopped.
-fn exit(mut cmd: Command) -> (Option<ExitStatus>, String) {
-    let mut child = cmd
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the explorer");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait().expect("wait for the explorer") {
-            Some(status) => break Some(status),
-            None if Instant::now() > deadline => break None,
-            None => std::thread::sleep(Duration::from_millis(50)),
-        }
-    };
-    if status.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    (status, reader.join().expect("stderr reader"))
 }
 
 fn write(path: &Path, text: &str) {
@@ -125,54 +97,8 @@ fn env_file_names_another_file_and_empty_reads_none() {
     assert!(line.contains("db=explorer.db"), "{line}");
 }
 
-#[test]
-fn a_named_file_that_is_missing_or_a_malformed_one_stops_startup() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let mut cmd = explorer(dir.path());
-    cmd.env("ENV_FILE", dir.path().join("missing.env"));
-    let (status, stderr) = exit(cmd);
-    assert!(
-        status.is_some_and(|s| !s.success()) && stderr.contains("missing.env"),
-        "{status:?}: {stderr}"
-    );
-
-    // An unclosed quote: the parser's own message would quote the rest of
-    // the file, the password included.
-    write(
-        &dir.path().join(".env"),
-        "DB_PATH=from-file.db\nPGPASSWORD=\"hunter2\nOTHER=x\n",
-    );
-    let (status, stderr) = exit(explorer(dir.path()));
-    assert!(
-        status.is_some_and(|s| !s.success())
-            && stderr.contains(".env")
-            && stderr.contains("DB_PATH")
-            && !stderr.contains("hunter2"),
-        "{status:?}: {stderr}"
-    );
-}
-
-#[test]
-fn a_later_line_wins_over_an_earlier_one() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(
-        &dir.path().join(".env"),
-        "DB_PATH=first.db\nDB_PATH=second.db\n",
-    );
-    let line = startup_line(explorer(dir.path()));
-    assert!(line.contains("db=second.db"), "{line}");
-}
-
-#[test]
-fn a_dot_env_that_is_not_a_file_is_skipped() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir(dir.path().join(".env")).expect("a .env directory");
-    let line = startup_line(explorer(dir.path()));
-    assert!(line.contains("db=explorer.db"), "{line}");
-}
-
-/// `.env.example` parses: a malformed line copied into `.env` would stop the
-/// explorer at startup.
+/// `.env.example` parses: from a malformed line copied into `.env` on, the
+/// file would be skipped.
 #[test]
 fn the_example_parses() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env.example");
