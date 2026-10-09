@@ -1524,10 +1524,10 @@ Under `ROLE=web`, `src/follow.rs` runs one task on the read pool:
 - **Rollout.** The three `temp_db` helpers (`decoder.rs:13`, `pages.rs:27`,
   `live_rpc.rs:19`) switch to the shared one in stage 1, SQLite only, and
   gain Postgres in stage 4c.
-- **SQLite-only tests.** The 7 `db::lock` tests stay SQLite-only: the
-  `TEST_DB=postgres` job skips them by name, from a `--skip` list in
-  `postgres.yml`, so the test files need no edit. Tests that call `db::open`
-  with a file path, or `init_db` directly, stay on SQLite by construction.
+- **SQLite-only tests.** The `db::lock` tests in decoder, pages and
+  anchoring open SQLite with `db::open` and a file path, and the tests that
+  call `init_db` directly stay on SQLite too, so the `TEST_DB=postgres` job
+  runs every test in its suites.
 - **Backend-neutral rebuild.** The rebuild step of
   `pages.rs::a_genesis_balance_counts_once` gets a backend-neutral copy.
 

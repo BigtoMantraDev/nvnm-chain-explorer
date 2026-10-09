@@ -292,8 +292,7 @@ cargo test --test live_rpc --test baseline
 # The same suites, and the Postgres ones, against Postgres
 docker compose up -d --wait
 export PG_TEST_URL=postgres://explorer:explorer@localhost:5432/explorer
-TEST_DB=postgres cargo test --test decoder --test anchoring --test pages -- \
-    --skip duplicate_bundle_is_idempotent --skip anchoring_events_read_back_by_registry
+TEST_DB=postgres cargo test --test decoder --test anchoring --test pages
 cargo test --lib -- --include-ignored
 cargo test --features db-coverage --test postgres --test migrations --test replay \
     --test differential --test grid --test locks --test indexer_pg --test outage_drills \

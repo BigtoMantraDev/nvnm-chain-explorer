@@ -235,9 +235,8 @@ returns 503: its metadata save waits on the writer.
 docker compose up -d --wait
 export PG_TEST_URL=postgres://explorer:explorer@localhost:5432/explorer
 
-# The usual suites, on Postgres. The db::lock tests are SQLite-only.
-TEST_DB=postgres cargo test --test decoder --test anchoring --test pages -- \
-    --skip duplicate_bundle_is_idempotent --skip anchoring_events_read_back_by_registry
+# The usual suites, on Postgres.
+TEST_DB=postgres cargo test --test decoder --test anchoring --test pages
 
 # The Postgres suites: replay, the differential, the parity grid (with its
 # coverage gate), migrations, locks and outages.
