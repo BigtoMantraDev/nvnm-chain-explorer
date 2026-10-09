@@ -41,7 +41,7 @@ the GKE pods. Section 15 ties acceptance to both goals.
 ### Decisions this spec is built on
 
 Made in brainstorming on 2026-10-03, and extended in review on
-2026-10-05:
+2026-10-05 and 2026-10-06:
 
 1. **Where it runs.** On GCP, in the same region as the database. The
    deployment examples are for Kubernetes only. Production runs on
@@ -85,6 +85,9 @@ Made in brainstorming on 2026-10-03, and extended in review on
    go/no-go in section 10 passes. Each process
    connects to exactly one database, and there is no SQLite importer.
 10. **Integration tests compare the baseline fixtures on Postgres too.**
+11. **No TLS to the database** (owner, 2026-10-06). sqlx is built without
+    a TLS feature, so every connection is plaintext, and the database is
+    reachable only over a private network (section 7).
 
 ### What this phase delivers
 
@@ -93,9 +96,9 @@ Made in brainstorming on 2026-10-03, and extended in review on
   behaviour does not change.
 - **A hand-written Postgres backend** on sqlx 0.9. Its writer is set-based:
   at most 14 round trips per 64-block batch, against about 642 statements
-  per batch today for the `write_scale` block shape. If the set-based
-  writer cannot reach equal tables in stage 4b, a per-row writer ships
-  instead (section 10).
+  per batch today for the `write_scale` block shape. It passed the stage
+  4b gate, equal tables on `canary-rich`, so the per-row fallback did not
+  ship (section 10).
 - **One writer per database.** The writer is fenced by the session that
   holds a session-level advisory lock, and it survives a database restart
   without losing a block.
@@ -192,26 +195,27 @@ becomes the fallback.
 
 ## 2. Module layout
 
-| Path                                                      | Owns                                                                                                                                                                                                                                                                                                                 | New lines (est.) |
-|-----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------|
-| `src/db/mod.rs`                                           | `Db`, `Backend`, `Role`, `DbConfig`, `DbUrl`, `open`, `open_with`, `status`, `keepalive`, the `db_fn!` list (43 entries), the hand-written `save_anchoring_window`, `save_block_bundle(s)` and `save_token_metadata`, the token-label cache, test hooks, the `db-coverage` recorder (`coverage::hit`), the seal test | ~450             |
-| `src/db/sqlite.rs`                                        | `git mv src/db.rs`: upstream's code                                                                                                                                                                                                                                                                                  | section 4        |
-| `src/db/indexer_jobs.rs`, `src/db/schema_check.rs`        | Unchanged paths, loaded through `#[path]` from `sqlite.rs`                                                                                                                                                                                                                                                           | section 4        |
-| `src/db/sqlite/migrate.rs`                                | SQLite runner (v1 = `init_db`), shape hash, `init_db` pins, commute guard                                                                                                                                                                                                                                            | ~160             |
-| `src/db/sqlite/extra.rs`                                  | New SQLite queries, which never edit existing ones (e.g. `tokens_missing_metadata`)                                                                                                                                                                                                                                  | ~40              |
-| `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), header parsing, checksums, the web schema gate                                                                                                                                                                                                                | ~150             |
-| `src/db/pg/mod.rs`                                        | `PgDb`, pools, connect options, TLS policy, the version floor, session settings, `DbError` and its classifier, `DB_FAILED`, preflight                                                                                                                                                                                | ~350             |
-| `src/db/pg/writer.rs`                                     | Candidate loop, lock and self-checks, spawned and cancel-safe `with_txn`, budgets, watchdog, lease, `writer_seq`, leadership watch                                                                                                                                                                                   | ~380             |
-| `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `fetch_one`, `fetch_all`, `exec`, `exec_best_effort`, all with client deadlines; statement counter                                                                                                                                      | ~170             |
-| `src/db/pg/shared.rs`                                     | Copies of `hex_blob`, `blob_hex`, `blob_addr`, `bigint`; column-list macros; the `HOLDING` text                                                                                                                                                                                                                      | ~70              |
-| `src/db/pg/{blocks,txs,tokens,transfers,kv,selectors}.rs` | Read SQL and row mappers                                                                                                                                                                                                                                                                                             | ~1,200           |
-| `src/db/pg/plan.rs`                                       | Pure batch planner: dedup, net balance deltas, holder deltas. Dropped if stage 4b falls back to the per-row writer                                                                                                                                                                                                   | ~200             |
-| `src/db/pg/{write,jobs,migrate}.rs`                       | Set-based writes, jobs, the Postgres runner and grants                                                                                                                                                                                                                                                               | ~900             |
-| `src/follow.rs`                                           | The web-role polling follower: live blocks, stats, schema gate, label-cache refresh                                                                                                                                                                                                                                  | ~150             |
-| `src/metrics.rs`                                          | The Prometheus recorder, the series in section 8 and the `/metrics` route                                                                                                                                                                                                                                            | ~100             |
-| `migrations/postgres/0001_baseline.sql`                   | `src/db/schema_pg.sql`, moved; `idx_tb_holding` gains `holder_addr`                                                                                                                                                                                                                                                  | moved            |
-| `migrations/{sqlite,postgres}/NNNN_name.sql`              | Schema changes from 0002 on                                                                                                                                                                                                                                                                                          | —                |
-| `deploy/k8s/`                                             | Manifests, secrets template and README (section 8)                                                                                                                                                                                                                                                                   | —                |
+| Path                                                      | Owns                                                                                                                                                                                                                                                                                                                   | New lines (est.) |
+|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------|
+| `src/db/mod.rs`                                           | `Db`, `Backend`, the re-exports of `config.rs`, `open`, `open_with`, `status`, `keepalive`, the `db_fn!` list (43 entries), the hand-written `save_anchoring_window`, `save_block_bundle(s)` and `save_token_metadata`, the token-label cache, test hooks, the `db-coverage` recorder (`coverage::hit`), the seal test | ~450             |
+| `src/db/config.rs`                                        | `Role`, `DbTarget`, `DbUrl` and `DbConfig`, read from the environment; `pg_options`, the connect options with the credentials applied and the `sslmode` rule (section 7)                                                                                                                                               | section 11       |
+| `src/db/sqlite.rs`                                        | `git mv src/db.rs`: upstream's code                                                                                                                                                                                                                                                                                    | section 4        |
+| `src/db/indexer_jobs.rs`, `src/db/schema_check.rs`        | Unchanged paths, loaded through `#[path]` from `sqlite.rs`                                                                                                                                                                                                                                                             | section 4        |
+| `src/db/sqlite/migrate.rs`                                | SQLite runner (v1 = `init_db`), shape hash, `init_db` pins, commute guard                                                                                                                                                                                                                                              | ~160             |
+| `src/db/sqlite/extra.rs`                                  | New SQLite queries, which never edit existing ones (e.g. `tokens_missing_metadata`)                                                                                                                                                                                                                                    | ~40              |
+| `src/db/migrations.rs`                                    | Shared version list (`include_str!` of both dialects), header parsing, checksums, the web schema gate                                                                                                                                                                                                                  | ~150             |
+| `src/db/pg/mod.rs`                                        | `PgDb`, pools, the version floor, session settings, `DbError` and its classifier, `DB_FAILED`, preflight                                                                                                                                                                                                               | ~350             |
+| `src/db/pg/writer.rs`                                     | Candidate loop, lock and self-checks, spawned and cancel-safe `with_txn`, budgets, watchdog, lease, `writer_seq`, leadership watch                                                                                                                                                                                     | ~380             |
+| `src/db/pg/q.rs`                                          | `query_rows`, `try_query_rows`, `query_opt`, `try_query_opt`, `query_count`, `fetch_one`, `fetch_all`, `exec`, `exec_best_effort`, all with client deadlines; statement counter                                                                                                                                        | ~170             |
+| `src/db/pg/shared.rs`                                     | Copies of `hex_blob`, `blob_hex`, `blob_addr`, `bigint`; column-list macros; the `HOLDING` text                                                                                                                                                                                                                        | ~70              |
+| `src/db/pg/{blocks,txs,tokens,transfers,kv,selectors}.rs` | Read SQL and row mappers                                                                                                                                                                                                                                                                                               | ~1,200           |
+| `src/db/pg/plan.rs`                                       | Pure batch planner: dedup, net balance deltas, holder deltas. Dropped if stage 4b falls back to the per-row writer                                                                                                                                                                                                     | ~200             |
+| `src/db/pg/{write,jobs,migrate}.rs`                       | Set-based writes, jobs, the Postgres runner and grants                                                                                                                                                                                                                                                                 | ~900             |
+| `src/follow.rs`                                           | The web-role polling follower: live blocks, stats, schema gate, label-cache refresh                                                                                                                                                                                                                                    | ~150             |
+| `src/metrics.rs`                                          | The Prometheus recorder, the series in section 8 and the `/metrics` route                                                                                                                                                                                                                                              | ~100             |
+| `migrations/postgres/0001_baseline.sql`                   | `src/db/schema_pg.sql`, moved; `idx_tb_holding` gains `holder_addr`                                                                                                                                                                                                                                                    | moved            |
+| `migrations/{sqlite,postgres}/NNNN_name.sql`              | Schema changes from 0002 on                                                                                                                                                                                                                                                                                            | —                |
+| `deploy/k8s/`                                             | Manifests, secrets template and README (section 8)                                                                                                                                                                                                                                                                     | —                |
 
 The module root is `src/db/mod.rs`, not a new `src/db.rs`. Deleting
 `src/db.rs` lets git pair the rename, so teammates' edits to `src/db.rs`
@@ -230,7 +234,7 @@ pub enum Role { All, Web, Indexer }
 /// scheme (`localhost:5432` counts, section 7), picks Postgres; anything
 /// else is a SQLite path. Role::All.
 pub async fn open(path_or_url: &str) -> anyhow::Result<Db>;
-/// main.rs: role, URL, TLS material, and the status channel /readyz reads.
+/// main.rs: role, URL, credentials, and the status channel /readyz reads.
 pub async fn open_with(cfg: &DbConfig, status: watch::Sender<Status>) -> anyhow::Result<Db>;
 
 macro_rules! db_fn {
@@ -1176,8 +1180,8 @@ each case:
 ## 7. Postgres targets: Cloud SQL and Kubernetes
 
 **Configuration.** `DATABASE_URL` selects Postgres and carries the host,
-port, database and TLS parameters (`sslmode` and `sslrootcert=/path`, which
-sqlx parses). In production it carries no credentials: the user and the
+port and database. The connection is plaintext ("No TLS" below). In
+production it carries no credentials: the user and the
 password are the separate variables `PGUSER` and `PGPASSWORD`, so the
 password can be injected into the pod from Secret Manager without any URL
 holding it. `ROLE` picks the role. `DB_PATH` stays the SQLite setting, and
@@ -1194,7 +1198,8 @@ alone still opens the file.
   options only where the URL has no user or no password. sqlx's
   `PgConnectOptions::from_str` reads the same variables as its defaults
   (`sqlx-postgres-0.9.0/src/options/parse.rs:9-10`, `mod.rs:56-98`), so the
-  two agree.
+  two agree. It reads `PGSSLMODE` the same way, for the `sslmode` rule
+  ("No TLS" below).
 - **Precedence.** A user or password written into the URL wins. The
   manifests never put one there. Local and CI runs may, so
   `postgres://explorer:explorer@localhost:5432/explorer` (`AGENTS.md`)
@@ -1230,8 +1235,9 @@ alone still opens the file.
 - **Anything else is a SQLite path:** `explorer.db`, `/data/explorer.db`,
   `:memory:`, `C:\data\explorer.db`, `localhost` (no port) and
   `file:x.db`.
-- **Missing parts come from the environment.** The user is `PGUSER` and
-  the password is `PGPASSWORD` (see "Credentials" above). The database is
+- **Missing parts come from the environment.** The user is `PGUSER`, the
+  password is `PGPASSWORD` (see "Credentials" above), and the `sslmode` is
+  `PGSSLMODE` (see "No TLS" below). The database is
   `PGDATABASE` or the server's default
   (`sqlx-postgres-0.9.0/src/options/mod.rs:56-98`). So `localhost:5432`
   against docker-compose needs `PGUSER`, `PGPASSWORD` and `PGDATABASE`, or
@@ -1239,8 +1245,9 @@ alone still opens the file.
 - **No silent fallback.** A string classified as Postgres that fails to
   parse is an error, never a SQLite file. A `DATABASE_URL` that classifies
   as a SQLite path is refused with "use `DB_PATH` for SQLite".
-- **The TLS policy still applies.** Loopback needs no `sslmode`;
-  `db.internal:5432` without `?sslmode=verify-full` is refused.
+- **The `sslmode` rule still applies.** `localhost:5432` and
+  `db.internal:5432` both connect in plaintext, and
+  `db.internal:5432?sslmode=verify-full` is refused.
 - **Tests and stage.** A unit test runs every example above in both
   directions, and `DbUrl` redacts the password in either form. The
   classifier lands in stage 3, with `open`'s Postgres arm.
@@ -1249,27 +1256,38 @@ alone still opens the file.
 |---------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Endpoint                  | The instance's PSA DNS name (from `dnsNames`, `…sql-psa.goog`), port 5432. Cloud SQL creates no record for PSA, so a Cloud DNS private-zone record maps that name to the private IP                                                  | The primary's read-write Service, `<cluster>-rw.<ns>.svc`, port 5432                                                                                                                                                                                                                                                                                                            |
 | Not usable for the writer | Managed Connection Pooling and the Auth Proxy. Transaction mode forbids session locks, and through a proxy the keepalives cannot see a dead client                                                                                   | A PgBouncer `Pooler`, for the same reason; the `-ro` and `-r` Services. With `instances: 1`, `-ro` has no endpoints, so the connection fails and is retried as `Unavailable`, and `-r` reaches the primary only because it is the sole instance. Once replicas exist, the recovery self-check refuses a replica reached through either. `deploy/k8s/README.md` names `-rw` only |
-| TLS                       | `sslmode=verify-full`. The server CA mode is `GOOGLE_MANAGED_CAS_CA` (or `CUSTOMER_MANAGED_CAS_CA`), which puts the DNS name in the certificate; `sslrootcert` is the CA bundle                                                      | `sslmode=verify-full`, with the operator's CA from its Secret. The Service name is in the certificate                                                                                                                                                                                                                                                                           |
-| Auth                      | Password users. `PGPASSWORD` comes from Secret Manager through a Kubernetes Secret synced from it (for example by External Secrets Operator), referenced with `secretKeyRef`. IAM can come later through `Pool::set_connect_options` | The operator-generated Secret: `PGUSER` and `PGPASSWORD` from its `username` and `password` keys (client certificates optional)                                                                                                                                                                                                                                                 |
+| TLS                       | None: plaintext over the private IP only. Leave "Allow only SSL connections" off                                                                                                                                                     | None: plaintext over the ClusterIP Service                                                                                                                                                                                                                                                                                                                                      |
+| Auth                      | Password users. `PGPASSWORD` comes from Secret Manager through a Kubernetes Secret synced from it (for example by External Secrets Operator), referenced with `secretKeyRef`. IAM can come later through `Pool::set_connect_options` | The operator-generated Secret: `PGUSER` and `PGPASSWORD` from its `username` and `password` keys                                                                                                                                                                                                                                                                                |
 | HA                        | Not used (decision 2): a standalone instance. HA, if added later, fails over in about 60 s with no data loss, through the same DNS name                                                                                              | Not used (decision 2): `instances: 1`, so there is no replica to promote. Asynchronous replicas added later can lose the last commits on failover, which `writer_seq` catches                                                                                                                                                                                                   |
 | `max_connections`         | Set by machine size (e.g. 500 at 15 GB)                                                                                                                                                                                              | The operator's setting (often 100)                                                                                                                                                                                                                                                                                                                                              |
 
-**TLS policy.**
+**No TLS** (decision 11).
 
-- **`verify-full` only.** `open_with` accepts only `sslmode=verify-full`
-  for any host that is not loopback or a Unix socket.
-- **Why `verify-ca` is not enough.** In sqlx 0.9 it adds `sslrootcert` to
-  the bundled public web roots, and then accepts a certificate issued for
-  any name (`sqlx-core-0.9.0/src/net/tls/tls_rustls.rs:139-160`, the
-  `NoHostnameTlsVerifier`). Any publicly trusted certificate would pass,
-  so it does not verify identity.
-- **Why `require` is not enough.** It verifies nothing
-  (`sqlx-postgres-0.9.0/src/connection/tls.rs:47-51`).
-- **The exception:** `DB_TLS_INSECURE=1` allows the weaker modes, logs a
-  warning on every start, and exists for in-cluster plaintext setups.
-- **Certificate rotation.** During a CA rotation the bundle holds both CAs.
-- **Test.** A server certificate from another CA, and one for another
-  hostname, must both be refused.
+- **Plaintext only.** sqlx is built with `runtime-tokio` and `postgres`
+  and no TLS feature, so every connection is plaintext. The database must
+  be reachable only over a private network: Cloud SQL's private IP, or a
+  ClusterIP Service.
+- **The `sslmode` rule.** `DbConfig::pg_options` refuses at start any
+  `sslmode` but `disable`, rather than quietly downgrading it. `prefer`
+  and `allow` are refused too: they ask for TLS where the server offers
+  it, and without a TLS feature sqlx connects them in plaintext without a
+  word (`sqlx-postgres-0.9.0/src/connection/tls.rs:24-30`). The mode is
+  the URL's (`sslmode` or `ssl-mode`, the last of several, as sqlx reads
+  it), or else `PGSSLMODE`. Naming none is plaintext, whatever the host.
+- **Test.** `connections_are_plaintext_and_a_url_asking_for_tls_is_refused`
+  (`src/db/config.rs`, no network). No `sslmode`, or `disable` in any
+  letter case, gets plaintext options, for a TCP host or a Unix socket.
+  `allow`, `prefer`, `ssl-mode=prefer`, `sslmode=disable&sslmode=prefer`,
+  `require`, `verify-ca` and `verify-full` are refused, and so is
+  `PGSSLMODE=prefer` or `require` unless the URL says `disable`.
+- **Adding TLS later** needs a sqlx TLS feature, a `pg_options` that
+  accepts `verify-full` (today it refuses every mode but `disable` and
+  sets `PgSslMode::Disable`), `sslmode=verify-full` and a CA bundle in the
+  pods. Nothing weaker verifies the server in
+  sqlx 0.9: `verify-ca` adds `sslrootcert` to the bundled public web roots
+  and then accepts a certificate issued for any name
+  (`sqlx-core-0.9.0/src/net/tls/tls_rustls.rs:139-160`), and `require`
+  verifies nothing (`sqlx-postgres-0.9.0/src/connection/tls.rs:47-51`).
 
 **Version floor: PostgreSQL 15, checked at open**
 (`PgConnection::server_version_num()`, with no extra query).
@@ -1400,7 +1418,6 @@ flowchart LR
 
 - `secrets.example.yaml`, holding only each deployment's `PGPASSWORD`.
   The URL and the user are not secret;
-- the CA mount;
 - `deploy/k8s/README.md`, with the deploy order (indexer first) and a
   Cloud Run note. On Cloud Run, the same image runs with min = max = 1
   indexer instances and instance-based billing. The web startup probe there
@@ -1625,8 +1642,8 @@ which serves as the reference, and through `BatchPlan`. Balances and
 
 **Outage drills**
 
-- Restart the Postgres container mid-replay. The final compare must equal
-  the baseline.
+- Restart the Postgres container mid-replay (`tests/restart_drill.rs`,
+  stage 6). The final compare must equal the baseline.
 - A blackhole TCP proxy (about 80 lines) covers half-open sessions:
   - a web read gets a 503 within about 7 s, and the pool recovers;
   - the watchdog cancels a `Long` statement within 4 × (15 s + 5 s).
@@ -1660,28 +1677,28 @@ label.
 - **Nightly:** the same against `postgres:15.x`.
 - **`Cargo.toml`** gains `rust-version = "1.94"`, because sqlx 0.9 requires
   it (`sqlx-core-0.9.0/Cargo.toml:14`). sqlx is pinned to `=0.9.0`, with
-  `tls-rustls-ring-webpki`. From stage 1 it also declares `db-coverage = []`
-  under `[features]`, so the coverage `cfg` is known and `unexpected_cfgs`
-  stays quiet under `-D warnings`.
+  only `runtime-tokio` and `postgres` (decision 11). From stage 1 it also
+  declares `db-coverage = []` under `[features]`, so the coverage `cfg` is
+  known and `unexpected_cfgs` stays quiet under `-D warnings`.
 
 ## 10. Rollout
 
 Each stage is a PR that merges with CI green.
 
-| Stage             | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Behaviour                                                                                                                                         |
-|-------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0 (upstream PRs)  | `block.html` uses `previous_block` instead of `get_block_url`. `resolve_search` and the option-combinator closures become `if let`. The `let _ =` writes are logged (`web.rs:1567`, `tests/live_rpc.rs:152`). The shutdown budget                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Preserved, except shutdown: on SIGINT or SIGTERM the process exits within 3 s                                                                     |
-| 1 (coordinated)   | The `git mv` and section 4's stage-1 edits. `db/mod.rs` with `Backend::Sqlite` only, and the token-label cache with the three write wrappers that keep it current. `sqlite/extra.rs` starts here, with `try_all_token_metas` for the cache's seed. `Cargo.toml` declares `db-coverage = []`, and `db_fn!` and the hand-written wrappers carry their `coverage::hit` lines from here on; the gate that checks them lands in 4c. The cache replaces Tera's `address_label` lookups because Tera functions are sync. `.await` across `web.rs`, `indexer.rs`, `signatures.rs`, `main.rs` and every test, including `tests/postgres.rs:755`, `write_scale.rs:75` and `baseline.rs`. The shared `temp_db` helper. A seal test forbidding `block_in_place` and `Handle::block_on` | Identical; the baseline must match                                                                                                                |
-| 2 (coordinated)   | `migrations.rs`, `sqlite/migrate.rs` and the rest of `sqlite/extra.rs`, and section 4's stage-2 edits. The pins, the commute guard and the immutability CI step. An org admin makes the header test a required check on NVNM-Chain's `main`, with branches up to date before merging. `schema_pg.sql` → `migrations/postgres/0001_baseline.sql` (`holder_addr` added to `idx_tb_holding`), with `tests/postgres.rs` updated. `schema_migrations` joins `NOT_INDEXED` in `tests/baseline.rs`. `Dockerfile`: `COPY migrations ./migrations` before `cargo build`, since `migrations.rs` reads them with `include_str!`. sqlx promoted to `[dependencies]`; `rust-version`. `ROLE` parsing (`all` only), `/healthz`, `/readyz`                                                | Files are adopted and stamped v1                                                                                                                  |
-| 3                 | `pg/mod.rs`: pools, the TLS policy and `DB_TLS_INSECURE`, the version floor, session settings, client deadlines, `q`, and every read. Postgres writes are stubs that return an error. `open` refuses `postgres://` outside `db::testing::open_pg_preview`. The parity grid runs over fixtures copied in with phase 2's round-trip code                                                                                                                                                                                                                                                                                                                                                                                                                                     | Not selectable in production                                                                                                                      |
-| 4a                | The writer: preflight, candidate, self-checks, spawned and cancel-safe `write`, budgets, watchdog, error classes, `keepalive`, `writer_seq`. The Postgres runner and grants. Simple writes and cache writes. Lock, cancel and classifier tests                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | —                                                                                                                                                 |
-| 4b                | `plan.rs` and its property test. Set-based `save_block_bundle(s)`. Two-pass anchoring. Replay and differential. **Writer gate:** equal tables on `canary-rich`. If they cannot be reached, 4b ships a per-row Postgres writer instead (a port of `write_block`, `db.rs:526-560`, inside `Writer::write`) and drops `plan.rs` and its property test. If the set-based writer ships, it must also stay within 14 round trips per batch (section 9). 4c proceeds either way                                                                                                                                                                                                                                                                                                   | —                                                                                                                                                 |
-| 4c                | Genesis, stats, repair and rebuilds (on the `Long` budget). `try_min_block_number` in `backfill_loop`. The missing-metadata job, with `take_tokens_without_metadata` and the bundle wrappers' noting; both stay idle until `ROLE=indexer` exists (stage 5). The `TEST_DB=postgres` job and the coverage gate. Postgres becomes selectable                                                                                                                                                                                                                                                                                                                                                                                                                                  | —                                                                                                                                                 |
-| 5                 | `ROLE=web` and `ROLE=indexer`. The follower. The 503 middleware and `exec_best_effort`. The web schema gate. In `indexer.rs`: the writer-loop `keepalive` and exit codes 3, 4 and 5. Bind-before-open and lock-free `/readyz`. `src/metrics.rs` and `/metrics`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `ROLE=all`: binds before open, and exits with code 5 when the writer, forward or backfill task ends (today it keeps serving). Otherwise unchanged |
-| 6                 | `DbUrl`. `deploy/k8s/`. The runbook, with the cutover checklist. `docs/database.md`. The live Postgres baseline in CI, and the nightly PG 15 job. The indexer's `sync` status in `/readyz`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | —                                                                                                                                                 |
-| 7                 | `.env`, for local development: `main` reads `ENV_FILE`, or `.env`, at startup; a variable already set wins. `.env.example` with local values                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Both backends: `.env` or `ENV_FILE` is read at startup; a line that does not parse is logged, and the file is read no further                     |
-| 8                 | `README.md`, after stages 0–7 have merged, so it describes the code that shipped (checklist below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Docs only                                                                                                                                         |
-| 9 (on a p95 miss) | `tokio::join!` of independent Postgres page queries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | SQLite unchanged                                                                                                                                  |
+| Stage             | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Behaviour                                                                                                                                                                                                                                                                          |
+|-------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 0 (upstream PRs)  | `block.html` links the parent through `parent_block` (the block below, when its hash is the parent hash) instead of `get_block_url`. `resolve_search` and the option-combinator closures become `if let`. The `let _ =` writes are logged (`web.rs:1567`, `tests/live_rpc.rs:152`). The shutdown budget                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Preserved, except shutdown: on SIGINT or SIGTERM the process exits within 3 s                                                                                                                                                                                                      |
+| 1 (coordinated)   | The `git mv` and section 4's stage-1 edits. `db/mod.rs` with `Backend::Sqlite` only, and the token-label cache with the three write wrappers that keep it current. `sqlite/extra.rs` starts here, with `try_all_token_metas` for the cache's seed. `Cargo.toml` declares `db-coverage = []`, and `db_fn!` and the hand-written wrappers carry their `coverage::hit` lines from here on; the gate that checks them lands in 4c. The cache replaces Tera's `address_label` lookups because Tera functions are sync. `.await` across `web.rs`, `indexer.rs`, `signatures.rs`, `main.rs` and every test that calls the API, `baseline.rs` included; the sync test hooks `init_db` (`tests/postgres.rs:755`) and `db::lock` (`write_scale.rs:75`) stay as they are. The shared `temp_db` helper. A seal test forbidding `block_in_place` and `Handle::block_on` | Identical; the baseline must match                                                                                                                                                                                                                                                 |
+| 2 (coordinated)   | `migrations.rs`, `sqlite/migrate.rs`, and `try_min_block_number` and `tokens_missing_metadata` in `sqlite/extra.rs`, and section 4's stage-2 edits. The pins, the commute guard and the immutability CI step. An org admin makes the header test a required check on NVNM-Chain's `main`, with branches up to date before merging. `schema_pg.sql` → `migrations/postgres/0001_baseline.sql` (`holder_addr` added to `idx_tb_holding`), with `tests/postgres.rs` updated. `schema_migrations` joins `NOT_INDEXED` in `tests/baseline.rs`. `Dockerfile`: `COPY migrations ./migrations` before `cargo build`, since `migrations.rs` reads them with `include_str!`. sqlx promoted to `[dependencies]`; `rust-version`. `ROLE` parsing (`all` only), `/healthz`, and `/readyz` with the web schema gate                                                      | Files are adopted and stamped v1                                                                                                                                                                                                                                                   |
+| 3                 | `src/db/pg/`: pools, plaintext connections (decision 11), the version floor, session settings, client deadlines, `q`, and every read but `holders_without_genesis_balance`. `config.rs`: `DATABASE_URL` (a bare `host:port` counts), `PGUSER`, `PGPASSWORD` and `PGSSLMODE`, the `sslmode` rule, and `DbUrl`, which never shows a password. `track_failures` and `DB_FAILED`. The cache writes (`set_trace`, `save_selector_names`) through `exec_best_effort` on the cache pool. The chain writes and `holders_without_genesis_balance` are stubs, most of which return an error. `db::open` and `open_with` accept Postgres, for the tests, and `main.rs` refuses `DATABASE_URL` and any `ROLE` but `all`. A test holds the Postgres column lists equal to SQLite's, and a lint keeps SQLite spellings out of the Postgres SQL                           | Not selectable in production                                                                                                                                                                                                                                                       |
+| 4a                | The writer: preflight, candidate, self-checks, spawned and cancel-safe `write`, budgets, watchdog, error classes, `keepalive`, `writer_seq`, and exit codes 3 (another session holds the lock) and 4 (commits were lost). The Postgres runner and grants. Simple writes: blocks, transactions, token metadata, `kv` and the chain head. Lock and classifier tests, the Postgres migration refusals and grants, and the outage drills in `tests/outage_drills.rs`                                                                                                                                                                                                                                                                                                                                                                                           | —                                                                                                                                                                                                                                                                                  |
+| 4b                | `plan.rs` and its property test. Set-based `save_block_bundle(s)`. Two-pass anchoring. Genesis balances, and the derived-table repair and rebuild (on the `Long` budget). Replay and differential, the live re-index into Postgres (`TEST_DB=postgres`), and the dropped-caller lock test. **Writer gate:** equal tables on `canary-rich`, within 14 round trips per batch (section 9). It was met, so the set-based writer shipped; the fallback was a per-row Postgres writer (a port of `write_block`, `db.rs:526-560`, inside `Writer::write`)                                                                                                                                                                                                                                                                                                         | —                                                                                                                                                                                                                                                                                  |
+| 4c                | The home-page stats. `try_min_block_number` in `backfill_loop`. The missing-metadata job, with `take_tokens_without_metadata` and the bundle wrappers' noting; both stay idle until `ROLE=indexer` exists (stage 5). The parity grid (`tests/grid.rs`) and its coverage gate, the `indexer_pg` suite, and the `TEST_DB=postgres` job. Postgres becomes selectable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | —                                                                                                                                                                                                                                                                                  |
+| 5                 | `ROLE=web` and `ROLE=indexer`. The follower, which also re-reads the schema version for the web schema gate. The 503 middleware. In `indexer.rs`: the writer-loop `keepalive`, and `supervise`, after which `main` exits with code 5 when the writer, forward or backfill task ends. Bind-before-open and lock-free `/readyz`, with the indexer's `sync` status. `src/metrics.rs` and `/metrics`                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `ROLE=all`: binds before open, and pages answer 503 until the database has opened. It exits with code 5 when the writer, forward or backfill task ends (today it keeps serving). On Postgres, a request whose reads failed answers 503 with `Retry-After: 30`. Otherwise unchanged |
+| 6                 | `deploy/k8s/`. The runbook, with the cutover checklist. `docs/database.md`. In the Postgres workflow: the live Postgres baseline, the restart drill (`tests/restart_drill.rs`), and a nightly run of every suite on PG 15                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | —                                                                                                                                                                                                                                                                                  |
+| 7                 | `.env`, for local development: `main` reads `ENV_FILE`, or `.env`, at startup; a variable already set wins. `.env.example` with local values                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Both backends: `.env` or `ENV_FILE` is read at startup; a line that does not parse is logged, and the file is read no further                                                                                                                                                      |
+| 8                 | `README.md`, after stages 0–7 have merged, so it describes the code that shipped (checklist below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Docs only                                                                                                                                                                                                                                                                          |
+| 9 (on a p95 miss) | `tokio::join!` of independent Postgres page queries                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | SQLite unchanged                                                                                                                                                                                                                                                                   |
 
 **Coordinating with teammates**
 
@@ -1712,16 +1729,20 @@ phase 3 makes stale:
   database newer than the binary (D > B) is refused, and the only way back
   is forward. Link `docs/database.md`.
 - **Indexer** (`README.md:110-127` and `207-225`): one writer task writes
-  to either backend, and under `ROLE=indexer` it holds the session advisory
-  lock. Replace "Serialized SQLite writes ... ~200 blocks/s" with both
-  backends' write paths and the Postgres re-index rate measured in section
-  12, item 7.
+  to either backend. On Postgres (`ROLE=indexer`, or `ROLE=all` with
+  `DATABASE_URL`) it holds the session advisory lock. Replace "Serialized
+  SQLite writes ... ~200 blocks/s" with both backends' write paths. The
+  Postgres re-index rate (section 12, item 7) is added once it has been
+  measured on the chosen target.
 - **Configuration** (`README.md:129-145`): add `DATABASE_URL`, `PGUSER`,
-  `PGPASSWORD`, `ROLE`,
-  `DB_WEB_ROLE`, `DB_TLS_INSECURE` and `FOLLOW_POLL_MS`, plus the existing
-  `DB_CACHE_KIB` (`db.rs:164`), which the table lacks today. `DB_PATH` stays
-  the SQLite setting, and `DATABASE_URL` wins when it is set. Note that
-  `DATABASE_URL` accepts `host:port` without a scheme (section 7).
+  `PGPASSWORD`, `PGSSLMODE`, `ROLE`, `DB_WEB_ROLE`, `FOLLOW_POLL_MS` and
+  stage 7's `ENV_FILE`, plus the existing `DB_CACHE_KIB` (`db.rs:164`),
+  `RECENT_BLOCK_COUNT` and `RECENT_TX_COUNT`, which the table lacks today.
+  Correct the stale defaults: `INDEX_WS` is off, `INDEX_BATCH` is 32 and
+  `NATIVE_SYMBOL` is `NVNM` (the Docker image sets `OM`), and nothing uses
+  `CHAIN_ID`. `DB_PATH` stays the SQLite setting, and `DATABASE_URL` wins
+  when it is set. Note that `DATABASE_URL` accepts `host:port` without a
+  scheme, and that the connection is plaintext (section 7).
 - **Routes** (`README.md:147-171`): add `/healthz`, `/readyz` and
   `/metrics` (the last under `ROLE=web` and `ROLE=indexer` only). The
   live-feed paragraph says the in-process feed is `ROLE=all`'s, and that
@@ -1877,7 +1898,7 @@ caller and SQLite counts):
 - **Infrastructure.** The Postgres target (a single primary, without HA)
   and two GKE deployments, in place of today's single SQLite deployment.
 
-**Build.** About 23 extra crates for sqlx with postgres and rustls. Both
+**Build.** About 23 extra crates for sqlx with postgres and no TLS. Both
 backends always compile, so clippy always checks both.
 
 ## 12. Risks and what to measure
@@ -1897,14 +1918,14 @@ backends always compile, so clippy always checks both.
 | The commute rule proves too restrictive                        | Stub patterns, two-release index changes, and the section 5 escape hatch                                                                                                                                                                                                                                                                                                                                        |
 | sqlx 0.9.0 is new                                              | Pinned to `=0.9.0`; MSRV 1.94                                                                                                                                                                                                                                                                                                                                                                                   |
 
-**What to measure.** These pick the writer and tune the target devops
-chose (decision 2). They do not decide whether Postgres ships. Items 2 and
+**What to measure.** Item 1 picked the writer; the rest tune the target
+devops chose (decision 2). They do not decide whether Postgres ships. Items 2 and
 4 need only a provisioned target and can run at any time; item 6 also needs
 the indexer and web deployments.
 
-1. The stage 4b writer gate: equal tables on `canary-rich`. If they cannot
-   be reached, the per-row writer ships (section 10); if the set-based
-   writer ships, it stays within 14 round trips per batch. Separately,
+1. The stage 4b writer gate: equal tables on `canary-rich`, within 14
+   round trips per batch. It was met, so the set-based writer shipped
+   (section 10). Separately,
    record the average Postgres lines per function (target 40 or fewer). It
    checks section 11's recurring cost and does not pick the writer.
 2. RTT and commit latency from the explorer's pods to the chosen database
@@ -1935,9 +1956,9 @@ the indexer and web deployments.
 
 - **Phase 2's "Recorded for phase 3: Sync vs async"** is superseded by
   section 1. The API is async, and there is no bridge.
-- **Phase 2's "`sslmode=require` for non-local hosts"** is wrong for
-  sqlx 0.9. `require` verifies nothing, and `verify-ca` does not verify
-  identity (section 7). Use `verify-full`.
+- **Phase 2's "`sslmode=require` for non-local hosts"** and its "adds a
+  rustls TLS feature" are superseded by decision 11: sqlx is built without
+  TLS, and any `sslmode` but `disable` is refused (section 7).
 - **Phase 2's "a writer pool of size 1"** is replaced by one owned session.
   A pool silently replaces its connection (`max_lifetime` defaults to
   30 min, `idle_timeout` to 10 min), and the session lock goes with it.
@@ -1965,8 +1986,8 @@ the indexer and web deployments.
   task after this phase, in its own PR (see "Known limitations").
 - HA for the database (decision 2). The design already tolerates it, so it
   can be added later with no code change.
-- Security hardening beyond section 7: a per-host `DB_TLS_INSECURE`, a
-  NetworkPolicy or authorized-networks rule, rate limits and request
+- Security hardening beyond section 7: TLS to the database (decision 11),
+  a NetworkPolicy or authorized-networks rule, rate limits and request
   timeouts on public pages, and `cargo audit` or `cargo deny` in CI.
 - Cloud Run manifests (a note in `deploy/k8s/README.md` only), and Fly.io
   or Render deployments of the Postgres mode.

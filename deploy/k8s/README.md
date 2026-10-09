@@ -57,8 +57,9 @@ reason to exit: the indexer waits for it, however long it takes.
 connection is plaintext, so the database must be reachable only over a
 private network (Cloud SQL's private IP, or a ClusterIP Service). Any
 `sslmode` but `disable`, in `DATABASE_URL` or `PGSSLMODE`, is refused at
-start rather than quietly downgraded, `prefer` and `allow` included, since
-both would try TLS. The URL's own `sslmode` wins over `PGSSLMODE`; set
+start rather than quietly downgraded. That includes `prefer` and `allow`:
+both ask for TLS where the server offers it, and this build would connect
+them in plaintext. The URL's own `sslmode` wins over `PGSSLMODE`; set
 neither.
 
 **Users and grants.** Create two users; the indexer's owns the schema:

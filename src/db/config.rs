@@ -300,7 +300,8 @@ impl DbConfig {
     /// build has no TLS, so every connection is plaintext: run the database on
     /// a private network. Any `sslmode` but `disable`, the URL's or
     /// `PGSSLMODE`, is refused, never quietly downgraded: `prefer` and `allow`
-    /// would try TLS too. Naming none is plaintext.
+    /// ask for TLS where the server offers it, and sqlx without TLS would
+    /// connect them in plaintext. Naming none is plaintext.
     pub fn pg_options(&self) -> Result<sqlx::postgres::PgConnectOptions> {
         use sqlx::postgres::{PgConnectOptions, PgSslMode};
         let DbTarget::Postgres(url) = &self.target else {
@@ -527,7 +528,7 @@ mod tests {
 
     /// This build has no TLS: every connection is plaintext, so any sslmode
     /// but `disable` is refused rather than quietly downgraded, `prefer` and
-    /// `allow` included, since both would try TLS.
+    /// `allow` included, which sqlx without TLS would connect in plaintext.
     #[test]
     fn connections_are_plaintext_and_a_url_asking_for_tls_is_refused() {
         for url in [
