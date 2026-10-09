@@ -27,7 +27,7 @@ pub struct Follower {
     db: Db,
     events: broadcast::Sender<Value>,
     stats: Arc<RwLock<Value>>,
-    /// The newest block broadcast; `None` until the first tick.
+    /// The newest block broadcast; `None` until a tick has read the tip.
     last: Option<i64>,
     /// The stats row's `updated_at` when last read.
     stats_at: Option<i64>,
@@ -58,14 +58,21 @@ impl Follower {
             db::update_status(&self.db, |s| s.schema.db = version);
         }
         match (self.last, newest) {
-            // The first tick starts at the tip: history is not replayed, but
-            // the tip's time is reported, for the staleness alert.
-            (None, _) => {
-                self.last = Some(newest.unwrap_or(0));
-                if let Some(tip) = newest {
-                    if let Some(block) = db::get_block_by_number(&self.db, tip).await {
-                        crate::metrics::latest_block_timestamp(block.timestamp);
-                    }
+            // The first tick that sees a block starts at the tip: history is
+            // not replayed, but the tip's time is reported, for the staleness
+            // alert. An empty table is no tip: backfill fills a fresh database
+            // from the head down, so following from 0 would wait for it to
+            // reach the bottom, then replay the chain. A failed read of the tip
+            // (logged where it failed) leaves the start unset, so the next
+            // tick reads it again; a row that does not decode is not.
+            (None, Some(tip)) => {
+                let (block, failed) =
+                    db::track_failures(db::get_block_by_number(&self.db, tip)).await;
+                if let Some(block) = block {
+                    crate::metrics::latest_block_timestamp(block.timestamp);
+                }
+                if !failed {
+                    self.last = Some(tip);
                 }
             }
             (Some(last), Some(newest)) if newest > last => self.broadcast(last, newest).await,
@@ -91,16 +98,30 @@ impl Follower {
 
     /// Blocks above `last`, oldest first, at most `MAX_BLOCKS`. `last` moves
     /// only as far as what was read, so a failed read is retried, never
-    /// skipped.
+    /// skipped. A block missing from a range that read is one the indexer
+    /// never wrote (a bundle refused for its content): blocks above the tip
+    /// commit in order through the one writer, so it will not turn up later,
+    /// and waiting for it would stop the feed.
     async fn broadcast(&mut self, last: i64, newest: i64) {
-        let to = newest.min(last + MAX_BLOCKS);
-        let mut blocks = db::get_blocks_in_range(&self.db, last + 1, to).await;
-        if blocks.is_empty() {
+        let (from, to) = (last + 1, newest.min(last + MAX_BLOCKS));
+        // A failed read comes back empty, as on a page; `track_failures` tells
+        // the two apart, and the failure is logged where it happened.
+        let db = &self.db;
+        let ((mut blocks, block_txs), failed) = db::track_failures(async {
+            let blocks = db::get_blocks_in_range(db, from, to).await;
+            if blocks.is_empty() {
+                return (blocks, Vec::new());
+            }
+            let txs = db::get_transactions_in_range(db, from, to, TxColumns::List).await;
+            (blocks, txs)
+        })
+        .await;
+        if failed || blocks.is_empty() {
             return;
         }
         blocks.sort_by_key(|b| b.number);
         let mut txs: HashMap<i64, Vec<_>> = HashMap::new();
-        for tx in db::get_transactions_in_range(&self.db, last + 1, to, TxColumns::List).await {
+        for tx in block_txs {
             txs.entry(tx.block_number).or_default().push(tx);
         }
         for block in &blocks {
@@ -214,6 +235,41 @@ mod tests {
             text.contains("explorer_latest_block_timestamp_seconds 1700000005"),
             "{text}"
         );
+    }
+
+    /// Backfill fills a fresh database from the head down. A follower that
+    /// started on the empty table follows from the first tip it sees; from 0
+    /// it would wait for backfill to reach the bottom, then replay the chain.
+    #[tokio::test]
+    async fn a_follower_started_on_an_empty_table_follows_from_the_first_tip() {
+        let (_dir, db, mut follower, mut rx) = setup().await;
+        follower.tick().await.unwrap();
+        for n in [1000, 1001] {
+            db::save_block_bundle(&db, &bundle(n)).await.unwrap();
+        }
+        follower.tick().await.unwrap();
+        assert!(blocks(&mut rx).is_empty(), "history is not replayed");
+        db::save_block_bundle(&db, &bundle(1002)).await.unwrap();
+        follower.tick().await.unwrap();
+        assert_eq!(blocks(&mut rx), [1002]);
+    }
+
+    /// A block the indexer never wrote (a bundle refused for its content) is
+    /// stepped over: blocks above the tip commit in order, so it never turns
+    /// up, and waiting for it would stop the feed.
+    #[tokio::test]
+    async fn a_block_never_written_does_not_stop_the_feed() {
+        let (_dir, db, mut follower, mut rx) = setup().await;
+        db::save_block_bundle(&db, &bundle(1)).await.unwrap();
+        follower.tick().await.unwrap();
+        for n in [2, 4] {
+            db::save_block_bundle(&db, &bundle(n)).await.unwrap();
+        }
+        follower.tick().await.unwrap();
+        assert_eq!(blocks(&mut rx), [2, 4]);
+        db::save_block_bundle(&db, &bundle(5)).await.unwrap();
+        follower.tick().await.unwrap();
+        assert_eq!(blocks(&mut rx), [5]);
     }
 
     #[tokio::test]

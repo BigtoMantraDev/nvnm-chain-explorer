@@ -1,10 +1,14 @@
-//! What the indexer leans on in the database under `ROLE=indexer`.
+//! What the indexer leans on in the database under `ROLE=indexer`, and what a
+//! web replica's follower does when a read fails.
 //!
 //! Needs a Postgres server: ignored unless run with `--include-ignored`, and
 //! then failing without `PG_TEST_URL`.
 
+use std::sync::{Arc, RwLock};
+
 use nvnmchain_explorer::db::{self, Db, Role, Status};
 use nvnmchain_explorer::decoder::checksum_address;
+use nvnmchain_explorer::follow::Follower;
 use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::tokens::TokenMeta;
 
@@ -203,4 +207,94 @@ async fn credentials_come_from_pguser_and_pgpassword() {
     .await
     .unwrap();
     assert_eq!(db::get_latest_block(&db).await.map(|b| b.number), Some(7));
+}
+
+/// A web replica's follower sends a block only with its transactions: when
+/// the transactions read fails, nothing is sent and nothing is skipped, and
+/// the next tick sends the block whole.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn the_follower_retries_a_failed_transactions_read() {
+    use sqlx::Connection as _;
+    let (_scratch, url) = backend::scratch_schema().await;
+    let indexer = open(&url, Role::Indexer).await;
+    db::save_block_bundle(&indexer, &bundle(1, NAMED, FEE))
+        .await
+        .unwrap();
+    let (events, mut rx) = tokio::sync::broadcast::channel(64);
+    let mut follower = Follower::new(
+        open(&url, Role::Web).await,
+        events,
+        Arc::new(RwLock::new(serde_json::Value::Null)),
+    );
+    follower.tick().await.unwrap();
+
+    db::save_block_bundle(&indexer, &bundle(2, NAMED, FEE))
+        .await
+        .unwrap();
+    // follow_point and the blocks read still work; the transactions read fails.
+    let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::raw_sql("ALTER TABLE transactions RENAME TO transactions_away")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    follower.tick().await.unwrap();
+    sqlx::raw_sql("ALTER TABLE transactions_away RENAME TO transactions")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    follower.tick().await.unwrap();
+
+    let sent: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|e| e["type"] == "block")
+        .collect();
+    assert_eq!(sent.len(), 1, "block 2, once: {sent:?}");
+    assert_eq!(sent[0]["block"]["number"], 2);
+    assert_eq!(
+        sent[0]["block"]["txs"].as_array().map(Vec::len),
+        Some(1),
+        "with its transaction"
+    );
+}
+
+/// A web replica that starts while the chain is stalled still reports the
+/// tip's time when its first read of the tip fails: the next tick reads it
+/// again. Otherwise the staleness alert has no series to fire on until a
+/// block arrives, and in a stall none does.
+#[tokio::test]
+#[ignore = "needs PG_TEST_URL; see AGENTS.md"]
+async fn a_failed_read_of_the_tip_is_read_again() {
+    use sqlx::Connection as _;
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let (_scratch, url) = backend::scratch_schema().await;
+    let indexer = open(&url, Role::Indexer).await;
+    let mut tip = bundle(5, NAMED, FEE);
+    tip.block.timestamp = 1_700_000_005;
+    db::save_block_bundle(&indexer, &tip).await.unwrap();
+    let mut follower = Follower::new(
+        open(&url, Role::Web).await,
+        tokio::sync::broadcast::channel(16).0,
+        Arc::new(RwLock::new(serde_json::Value::Null)),
+    );
+    let series = "explorer_latest_block_timestamp_seconds";
+
+    // The tip's number reads, but its row does not.
+    let mut admin = sqlx::PgConnection::connect(&url).await.unwrap();
+    sqlx::raw_sql("ALTER TABLE blocks RENAME COLUMN hash TO hash_away")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    follower.tick().await.unwrap();
+    assert!(!handle.render().contains(series), "the tip's read failed");
+    sqlx::raw_sql("ALTER TABLE blocks RENAME COLUMN hash_away TO hash")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+
+    // No block arrives, as in a stall: only a second read reports the tip.
+    follower.tick().await.unwrap();
+    let text = handle.render();
+    assert!(text.contains(&format!("{series} 1700000005")), "{text}");
 }
