@@ -47,7 +47,7 @@ jobs:
       - name: Run unit tests
         run: >
           cargo test --lib --test decoder --test anchoring --test pages
-          --test health --test migrations --test shutdown
+          --test health --test migrations --test outage --test shutdown
 
       - name: Run live RPC integration tests
         run: cargo test --test live_rpc --test baseline

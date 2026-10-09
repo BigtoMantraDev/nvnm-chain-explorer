@@ -1434,10 +1434,18 @@ Under `ROLE=web`, `src/follow.rs` runs one task on the read pool:
   block about every 0.48 s.
 - **One statement per tick:**
   `SELECT (SELECT MAX(number) FROM blocks), (SELECT updated_at FROM kv WHERE key = 'stats'), (SELECT MAX(version) FROM schema_migrations)`.
+- **Start.** The first tick that sees a block starts at the tip and
+  reports its time, for the staleness alert; history is not replayed. Until
+  the tip's row reads, the start stays unset. On an empty table it waits
+  for a block: backfill fills a fresh database from the head down.
 - **New blocks.** When the max is above `last`, the follower calls
   `get_blocks_in_range` and `get_transactions_in_range(last + 1, n)`,
   capped at 256 blocks, and broadcasts on the existing channel. Values at
-  or below `last` are ignored, the same rule as `sse_step`.
+  or below `last` are ignored, the same rule as `sse_step`. A block goes
+  out only with its transactions: when either read fails, nothing is sent
+  and `last` stays. A block the indexer never wrote (a bundle refused for
+  its content) is stepped over, since blocks above the tip commit in order
+  and it will not turn up later.
 - **Stats.** When the stats `updated_at` changes, the follower reads
   `kv['stats']`, updates the stats cell and broadcasts `{"type":"stats"}`.
   Without this, split mode would lose live stats, which `stats_loop` sends

@@ -1602,8 +1602,12 @@ pub async fn token_page(
                 return not_found(&state, &headers, &query, "Token", &address).await;
             }
             // The page renders the fetched descriptor whether or not this lands.
-            if let Err(e) = db::save_token_metadata(&state.db, &fetched).await {
-                tracing::warn!("save token metadata {checksummed}: {e:#}");
+            // A web replica writes no chain data: the indexer saves a token
+            // once it sees a transfer of it (README, "Known limitations").
+            if db::role(&state.db) != db::Role::Web {
+                if let Err(e) = db::save_token_metadata(&state.db, &fetched).await {
+                    tracing::warn!("save token metadata {checksummed}: {e:#}");
+                }
             }
             db::get_token_metadata(&state.db, &checksummed)
                 .await
@@ -2427,6 +2431,30 @@ async fn readyz(State(h): State<HealthState>) -> Response {
     (code, Json(status)).into_response()
 }
 
+/// Turn a response whose reads failed into a 503 with `Retry-After`, never a
+/// false 404 or an empty page, and time every page by its route.
+async fn database_guard(
+    matched: Option<axum::extract::MatchedPath>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    let (resp, failed) = db::track_failures(next.run(req)).await;
+    if let Some(route) = matched {
+        crate::metrics::request_duration(route.as_str(), started.elapsed().as_secs_f64());
+    }
+    if !failed {
+        return resp;
+    }
+    crate::metrics::http_503();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "30")],
+        "The database is unavailable; try again shortly.",
+    )
+        .into_response()
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
@@ -2447,6 +2475,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/search", get(search_page))
         .route("/api/search", get(search_suggest))
+        .route_layer(axum::middleware::from_fn(database_guard))
         // Public explorer: allow cross-origin reads from any site (the wallet
         // is hosted on a different origin and needs `?format=json`).
         .layer(CorsLayer::permissive())

@@ -154,7 +154,8 @@ pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Resu
     })
 }
 
-/// D for a web replica: read until it answers once.
+/// D for a web replica: read until it answers once. The follower keeps it
+/// current from there.
 async fn first_gate(read: PgPool, status: watch::Sender<Status>) {
     loop {
         match schema_version(&read).await {

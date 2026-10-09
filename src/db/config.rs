@@ -207,6 +207,8 @@ pub struct DbConfig {
     /// `DB_WEB_ROLE`: the database user web replicas connect as, granted read
     /// access by the indexer.
     pub web_role: String,
+    /// `FOLLOW_POLL_MS`: how often a web replica polls for new blocks.
+    pub follow_poll: std::time::Duration,
     pub tuning: Tuning,
 }
 
@@ -238,6 +240,10 @@ impl DbConfig {
         if !is_identifier(&web_role) {
             bail!("DB_WEB_ROLE={web_role:?}: use a plain identifier (letters, digits, _)");
         }
+        let follow_ms: u64 = match set("FOLLOW_POLL_MS") {
+            Some(v) => v.trim().parse().context("FOLLOW_POLL_MS")?,
+            None => 500,
+        };
         Ok(DbConfig {
             role,
             target,
@@ -245,6 +251,7 @@ impl DbConfig {
             password: lookup("PGPASSWORD").filter(|p| !p.is_empty()).map(Secret),
             ssl_mode: set("PGSSLMODE"),
             web_role,
+            follow_poll: std::time::Duration::from_millis(follow_ms.max(50)),
             tuning: Tuning::default(),
         })
     }
@@ -258,6 +265,7 @@ impl DbConfig {
             password: None,
             ssl_mode: None,
             web_role: "explorer_web".into(),
+            follow_poll: std::time::Duration::from_millis(500),
             tuning: Tuning::default(),
         }
     }
@@ -273,6 +281,7 @@ impl DbConfig {
             password: env("PGPASSWORD").map(Secret),
             ssl_mode: env("PGSSLMODE"),
             web_role: env("DB_WEB_ROLE").unwrap_or_else(|| "explorer_web".into()),
+            follow_poll: std::time::Duration::from_millis(500),
             tuning: Tuning::default(),
         }
     }

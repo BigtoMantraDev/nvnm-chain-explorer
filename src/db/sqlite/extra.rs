@@ -12,6 +12,21 @@ pub fn try_min_block_number(db: &Db) -> Result<Option<i64>> {
     Ok(get_min_block_number(db))
 }
 
+/// What a web replica's follower polls: the newest block, when the stats
+/// were last written, and the schema version. One statement; an error is
+/// returned, so the follower retries rather than taking it for "nothing new".
+pub fn follow_point(db: &Db) -> Result<(Option<i64>, Option<i64>, Option<i64>)> {
+    lock(db)
+        .query_row(
+            "SELECT (SELECT MAX(number) FROM blocks),
+                    (SELECT updated_at FROM kv WHERE key = 'stats'),
+                    (SELECT MAX(version) FROM schema_migrations)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .context("follow_point")
+}
+
 /// Token addresses a transfer or a fee names that have no metadata row, or
 /// why they could not be read: a failed scan is not "none missing".
 /// Undecodable rows are dropped and logged, as `query_rows` does.
@@ -134,6 +149,23 @@ mod tests {
         let mut want = vec![named, fee];
         want.sort();
         assert_eq!(missing, want);
+    }
+
+    #[test]
+    fn the_follow_point_is_the_newest_block_the_stats_time_and_the_version() {
+        let (_dir, db) = temp_db();
+        assert_eq!(
+            follow_point(&db).unwrap(),
+            (None, None, Some(crate::db::migrations::binary_version()))
+        );
+        sqlite::lock(&db)
+            .execute_batch(
+                "INSERT INTO blocks (number, hash, parent_hash, timestamp) VALUES (9, X'09', X'08', 0);
+                 INSERT INTO kv (key, value, updated_at) VALUES ('stats', '{}', 123);",
+            )
+            .unwrap();
+        let (block, stats, _) = follow_point(&db).unwrap();
+        assert_eq!((block, stats), (Some(9), Some(123)));
     }
 
     /// The label cache seeds from this; an empty list would erase every label

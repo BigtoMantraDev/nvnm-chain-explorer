@@ -1,16 +1,22 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::extract::Request;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
+use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
+use tower::ServiceExt;
 use tracing::{error, info, warn};
 
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db, DbConfig, DbTarget, Role};
+use nvnmchain_explorer::follow::{self, Follower};
 use nvnmchain_explorer::indexer::{self, IndexerConfig};
 use nvnmchain_explorer::rpc::ChainRpc;
-use nvnmchain_explorer::web;
+use nvnmchain_explorer::{metrics, web};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,13 +30,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Settings::from_env();
     let db_cfg =
         DbConfig::from_env(|key| std::env::var(key).ok()).context("database configuration")?;
-    // The database layer knows the split roles; this process runs only the
-    // single-process one until they land.
-    if db_cfg.role != Role::All {
-        anyhow::bail!("ROLE={} is not available yet; run as ROLE=all", db_cfg.role);
-    }
+    let role = db_cfg.role;
     info!(
-        "starting nvnmchain Explorer (rpc={}, db={})",
+        "starting nvnmchain Explorer (role={role}, rpc={}, db={})",
         cfg.rpc_url,
         match &db_cfg.target {
             DbTarget::Sqlite(path) => path.clone(),
@@ -39,67 +41,43 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
-    let (status_tx, status_rx) = watch::channel(db::Status::starting(db_cfg.role));
-    let db: Db = db::open_with(&db_cfg, status_tx)
-        .await
-        .context("initialize database")?;
-    let rpc = ChainRpc::from_settings(&cfg)?;
-    let tera = web::build_tera(db.clone())?;
-
-    // Background indexer: instant heads via WebSocket (poll fallback),
-    // concurrent block fetching, one serialized database writer.
-    let indexer_rpc = ChainRpc::from_settings(&cfg)?;
-    let indexer_db = db.clone();
-    let indexer_cfg = IndexerConfig::from_settings(&cfg);
-    let ws_url = cfg.ws_url.clone();
-    // Sized for ~an hour of sub-second blocks; combined with the writer's
-    // in-order emission and the SSE lag-replay, live viewers never see gaps.
-    let (block_tx, _) = broadcast::channel::<serde_json::Value>(8192);
-    let indexer_block_tx = block_tx.clone();
-    // Ctrl+C (or SIGTERM) flips this watch; every indexer loop checks it so
-    // the process stops promptly instead of continuing to fetch and index.
+    let (status_tx, status_rx) = watch::channel(db::Status::starting(role));
+    // Ctrl+C (or SIGTERM) flips this watch; every loop checks it so the
+    // process stops promptly instead of continuing to fetch and index.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     handle_signals(shutdown_tx)?;
-    let indexer_shutdown = shutdown_rx.clone();
-    // Home-page stats live here; the stats task refreshes them, the web
-    // handlers read them. Seeded from kv so a restart paints real numbers
-    // before the first recompute.
-    let home_stats = Arc::new(std::sync::RwLock::new(
-        db::get_kv(&db, "stats")
-            .await
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(serde_json::Value::Null),
-    ));
-    let indexer_stats = home_stats.clone();
-    let indexer_task = tokio::spawn(async move {
-        info!("indexer websocket feed: {ws_url}");
-        indexer::run_forever(
-            indexer_rpc,
-            indexer_db,
-            indexer_cfg,
-            indexer_block_tx,
-            indexer_stats,
-            indexer_shutdown,
-        )
-        .await
-    });
 
-    let state = web::AppState {
-        db,
-        rpc,
-        cfg: cfg.clone(),
-        tera,
-        block_events: block_tx,
-        stats: home_stats,
-        shutdown: shutdown_rx.clone(),
-    };
-    let app = web::health(status_rx, shutdown_rx.clone()).merge(web::app(state));
-
+    // Bind first: the probes answer while the database opens, which for an
+    // indexer can mean waiting as a candidate for the writer's lock.
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     info!("listening on http://{addr}");
+    let pages: Arc<OnceLock<Router>> = Arc::new(OnceLock::new());
+    let mut app = web::health(status_rx, shutdown_rx.clone());
+    if role != Role::All {
+        // In-cluster scraping only: `ROLE=all` runs where there is no Ingress
+        // to keep /metrics private.
+        app = app.merge(metrics::install()?);
+    }
+    if role != Role::Indexer {
+        let pages = pages.clone();
+        app = app.fallback(move |req: Request| {
+            let pages = pages.clone();
+            async move {
+                match pages.get() {
+                    Some(router) => router.clone().oneshot(req).await.into_response(),
+                    None => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [(header::RETRY_AFTER, "5")],
+                        "starting",
+                    )
+                        .into_response(),
+                }
+            }
+        });
+    }
     let mut stop = shutdown_rx.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = stop.wait_for(|&stop| stop).await;
@@ -107,27 +85,115 @@ async fn main() -> anyhow::Result<()> {
     let mut server = tokio::spawn(async move { server.await });
 
     let mut stopping = shutdown_rx.clone();
+    let db: Db = tokio::select! {
+        opened = db::open_with(&db_cfg, status_tx) => match opened {
+            Ok(db) => db,
+            Err(e) => {
+                // A preflight refusal or a configuration error: a broken image
+                // must never replace a working writer, so it exits, unready.
+                error!("database: {e:#}");
+                std::process::exit(1);
+            }
+        },
+        _ = stopping.wait_for(|&stop| stop) => {
+            info!("stopped before the database opened");
+            std::process::exit(0);
+        }
+    };
+
+    // Sized for ~an hour of sub-second blocks; combined with the writer's
+    // in-order emission and the SSE lag-replay, live viewers never see gaps.
+    let (block_tx, _) = broadcast::channel::<serde_json::Value>(8192);
+    // Home-page stats live here; the stats task (or, on a web replica, the
+    // follower) refreshes them, the web handlers read them. Seeded from kv so
+    // a restart paints real numbers before the first recompute.
+    let home_stats = Arc::new(std::sync::RwLock::new(
+        db::get_kv(&db, "stats")
+            .await
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null),
+    ));
+
+    let mut core = None;
+    match role {
+        Role::All | Role::Indexer => {
+            let indexer_rpc = ChainRpc::from_settings(&cfg)?;
+            if role == Role::Indexer {
+                tokio::spawn(metrics::watch_status(db.clone()));
+            }
+            let (db, events, stats, stop) = (
+                db.clone(),
+                block_tx.clone(),
+                home_stats.clone(),
+                shutdown_rx.clone(),
+            );
+            let indexer_cfg = IndexerConfig::from_settings(&cfg);
+            info!("indexer websocket feed: {}", cfg.ws_url);
+            core = Some(tokio::spawn(async move {
+                indexer::run_forever(indexer_rpc, db, indexer_cfg, events, stats, stop).await
+            }));
+        }
+        Role::Web => {
+            let follower = Follower::new(db.clone(), block_tx.clone(), home_stats.clone());
+            tokio::spawn(follow::run(
+                follower,
+                db_cfg.follow_poll,
+                shutdown_rx.clone(),
+            ));
+        }
+    }
+    if role != Role::Indexer {
+        let state = web::AppState {
+            tera: web::build_tera(db.clone())?,
+            rpc: ChainRpc::from_settings(&cfg)?,
+            db,
+            cfg: cfg.clone(),
+            block_events: block_tx,
+            stats: home_stats,
+            shutdown: shutdown_rx.clone(),
+        };
+        let _ = pages.set(web::app(state));
+    }
+
+    let ended = async {
+        match &mut core {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
-        // A signal stops the server too, so check for one first.
+        // A signal stops the server and the indexer too, so check for one first.
         biased;
         _ = stopping.wait_for(|&stop| stop) => {}
         r = &mut server => {
             r.context("server task")?.context("server error")?;
             anyhow::bail!("server stopped without a shutdown signal");
         }
+        r = ended => {
+            match r {
+                Ok(Err(e)) => error!("{e}; exiting so the process restarts"),
+                Ok(Ok(())) => error!("the indexer stopped; exiting so the process restarts"),
+                Err(e) => error!("the indexer panicked: {e}; exiting so the process restarts"),
+            }
+            std::process::exit(5);
+        }
     }
 
     // In-flight connections and the indexer loops drain together, within the
     // deadline the signal thread holds. A batch cut short there is replayed on
-    // the next start. Dropping the runtime instead would wait on blocking
-    // tasks with no bound at all.
+    // the next start; the dropped writer session frees the lock. Dropping the
+    // runtime instead would wait on blocking tasks with no bound at all.
     match server.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => error!("server error while shutting down: {e}"),
         Err(e) => error!("server task failed while shutting down: {e}"),
     }
-    if let Err(e) = indexer_task.await {
-        error!("indexer task failed while shutting down: {e}");
+    if let Some(core) = core {
+        match core.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("{e} while shutting down"),
+            Err(e) => error!("indexer task failed while shutting down: {e}"),
+        }
     }
     info!("shutdown complete");
     std::process::exit(0)
