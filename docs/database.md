@@ -211,23 +211,16 @@ false 404. Chain data is written only by the indexer's writer session, which
 holds a session-level advisory lock (`src/db/pg/writer.rs`); a web replica
 writes only the selector-name and trace caches.
 
-Configuration (`src/db/config.rs`):
-
-| Variable          | Meaning                                                                                          |
-|-------------------|--------------------------------------------------------------------------------------------------|
-| `DATABASE_URL`    | Postgres; `postgres://…`, or `host:port[/db][?params]`. Wins over `DB_PATH`. Plaintext only     |
-| `PGUSER`          | The user, when the URL names none                                                                |
-| `PGPASSWORD`      | The password, when the URL carries none; never logged                                            |
-| `PGSSLMODE`       | Only `disable`, or unset; the URL's own `sslmode` wins over it                                   |
-| `ROLE`            | `all` (default), `web` or `indexer`; the last two need Postgres                                  |
-| `DB_WEB_ROLE`     | The web replicas' database user, which the indexer grants to (default `explorer_web`)           |
-| `FOLLOW_POLL_MS`  | How often a web replica polls for new blocks (default 500)                                       |
+Configuration: `DATABASE_URL`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE`, `ROLE`,
+`DB_WEB_ROLE` and `FOLLOW_POLL_MS`, read by `src/db/config.rs`; `README.md`'s
+table has their defaults and meaning.
 
 `ROLE=all` on Postgres is supported for development, CI and small
 self-hosting. Production runs `ROLE=indexer` and `ROLE=web`
 (`deploy/k8s/README.md`, `docs/runbook.md`). Under `ROLE=all` on Postgres, a
-token page opened while the database is down hangs until it is back, then
-returns 503: its metadata save waits on the writer.
+token page opened while the database is down hangs until it is back (plus up
+to 30 s of writer backoff), then returns 503: its metadata save waits on the
+writer, and runs on after the client leaves.
 
 ### Running the Postgres tests
 

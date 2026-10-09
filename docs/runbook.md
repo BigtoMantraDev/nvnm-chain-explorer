@@ -113,10 +113,3 @@ A container's environment is fixed when it starts. Change the password in the
 database and in Secret Manager, wait for the synced Secret, then
 `kubectl rollout restart` both deployments, indexer first. Open sessions
 survive the change; new ones use the password the pod started with.
-
-## `ROLE=all` on Postgres
-
-Supported for development, CI and small self-hosting only. A token page
-opened while the database is down hangs until it is back (plus up to 30 s of
-writer backoff), then returns 503: its metadata save waits on the writer, and
-runs on after the client leaves.

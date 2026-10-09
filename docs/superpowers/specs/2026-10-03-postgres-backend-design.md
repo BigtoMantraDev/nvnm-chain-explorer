@@ -1726,7 +1726,8 @@ phase 3 makes stale:
 
 Before it merges, the reviewer checks that every variable in the
 configuration table is read by the code and every route in the routes table
-exists.
+exists. Since then, the README leaves the Postgres test commands and the
+migration details to `docs/database.md`.
 
 **Cutover: side by side** (decision 9)
 

@@ -1,8 +1,4 @@
 # The Postgres backend's suites. ci.yml runs everything that needs no server.
-#
-# Postgres is a service container. `command` starts it with
-# `-c max_connections=300`, as docker-compose.yml does: every test opens small
-# pools of its own.
 name: Postgres
 
 on:
