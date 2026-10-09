@@ -866,15 +866,9 @@ async fn sse_step(
                 let txs =
                     db::get_transactions_in_range(&state.db, start, end, TxColumns::List).await;
                 // Oldest first, since the writer emits in number order.
-                for block in blocks.into_iter().rev() {
-                    let first = txs.partition_point(|t| t.block_number < block.number);
-                    let past = txs.partition_point(|t| t.block_number <= block.number);
-                    state.pending.push_back(crate::models::block_event_json(
-                        &block,
-                        &txs[first..past],
-                        crate::models::STREAM_TX_CAP,
-                    ));
-                }
+                state
+                    .pending
+                    .extend(crate::models::block_events(&blocks, &txs));
                 state.last_num = state.last_num.max(end);
                 if let Some(v) = state.pending.pop_front() {
                     return Some((sse_event(&v), state));
