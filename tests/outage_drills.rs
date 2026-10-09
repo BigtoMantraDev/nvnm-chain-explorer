@@ -196,13 +196,11 @@ async fn a_half_open_read_fails_within_the_deadline_and_the_pool_recovers() {
     let dark = Arc::new(AtomicBool::new(false));
     let port = blackhole_proxy(upstream(&url), dark.clone()).await;
     let cfg: DbConfig = backend::pg_config(&via(&url, port), Role::Web);
-    let (status, mut seen) = tokio::sync::watch::channel(Status::starting(Role::Web));
+    let status = tokio::sync::watch::channel(Status::starting(Role::Web)).0;
     let web = db::open_with(&cfg, status).await.unwrap();
-    // The path goes dark under an idle pool. A web replica reads the schema
-    // version in the background as it opens, so wait for that; and sqlx pings
-    // each connection as it goes back to the pool, with no deadline, so let
-    // the last one land. Either, caught by the dark, holds its slot.
-    seen.wait_for(|s| s.schema.db.is_some()).await.unwrap();
+    // The path goes dark under an idle pool. sqlx pings each connection as it
+    // goes back to the pool, with no deadline, so let the last one land: caught
+    // by the dark, it holds its slot.
     let (_, failed) = db::track_failures(db::get_latest_block(&web)).await;
     assert!(!failed);
     tokio::time::sleep(Duration::from_millis(200)).await;

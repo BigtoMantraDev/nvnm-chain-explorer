@@ -134,10 +134,7 @@ pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Resu
         0,
     );
     let writer = match cfg.role {
-        Role::Web => {
-            tokio::spawn(first_gate(read.clone(), status.clone()));
-            None
-        }
+        Role::Web => None,
         Role::Indexer | Role::All => {
             let opts = base.application_name(&application_name(cfg.role, "writer"));
             Some(writer::Writer::start(opts, read.clone(), cfg, status.clone()).await?)
@@ -148,23 +145,6 @@ pub(crate) async fn open(cfg: &DbConfig, status: &watch::Sender<Status>) -> Resu
         cache,
         writer,
     })
-}
-
-/// D for a web replica: read until it answers once. The follower keeps it
-/// current from there.
-async fn first_gate(read: PgPool, status: watch::Sender<Status>) {
-    loop {
-        match schema_version(&read).await {
-            Ok(d) => {
-                status.send_modify(|s| s.schema.db = Some(d));
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("schema version: {e:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
 }
 
 /// D: the database's schema version, 0 before any migration ran. The table

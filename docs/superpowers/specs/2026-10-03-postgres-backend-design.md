@@ -1345,8 +1345,8 @@ flowchart LR
   credentials never leave it Ready. A preflight refusal (section 5) exits
   non-zero, so a broken image never replaces a working leader.
 - **Web startup.** `open_with` builds its pools lazily and never fails
-  because Postgres is unreachable. A background task evaluates the schema
-  gate.
+  because Postgres is unreachable. The follower evaluates the schema gate
+  from its first successful tick.
 - **`/readyz`.** It reports
   `{role, schema: {db, binary}, writer, preflight}`, plus `sync`
   on the indexer (section 10), from a status `watch` created before
