@@ -56,10 +56,10 @@ A schema change is a pull request to `NVNM-Chain/nvnmchain-explorer`'s
   `src/db/pg/`;
 - in `tests/postgres.rs`, a `TRANSLATED` pin for each expression or partial
   index it adds or changes, and an `ALLOWED` entry for each difference
-  between the engines it means to make. Each entry names the versions it
-  holds for: the version that changes or drops what one describes ends it
-  there (`until`), and a changed definition gets a new pin from that version
-  on (`since`), so the parity test still holds every older version to its own.
+  between the engines it means to make. Each entry holds from its version
+  (`since`) on. None has an end version yet: the first migration that changes
+  or drops what one describes adds one, and pins a changed definition in a new
+  entry, so the parity test still holds every older version to its own.
 
 Each file starts with headers, which `the_shipped_migrations_follow_the_rules`
 checks:

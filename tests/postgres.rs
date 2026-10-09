@@ -46,32 +46,14 @@ use nvnmchain_explorer::db::migrations::{
 /// The baseline, version 1.
 const SCHEMA: &str = include_str!("../migrations/postgres/0001_baseline.sql");
 
-/// The schema versions an `ALLOWED` or `TRANSLATED` entry holds for: `since`
-/// and every later one, up to `until`, the version that changes or removes
-/// what it describes, if one has. Each version is checked against the entries
-/// that hold for it, so an older one keeps the entries it had.
-#[derive(Clone, Copy, Debug)]
-struct Versions {
-    since: i64,
-    until: Option<i64>,
-}
-
-impl Versions {
-    /// `since` and every later version.
-    const fn from(since: i64) -> Self {
-        Versions { since, until: None }
-    }
-
-    fn hold_for(self, n: i64) -> bool {
-        self.since <= n && self.until.is_none_or(|until| n < until)
-    }
-}
-
 /// The differences between SQLite and Postgres that are intended:
-/// (table, column, field, SQLite, Postgres), why, and the versions it holds
-/// for. Each suppresses that one difference; one that does not occur at a
-/// version it holds for fails the parity test.
-const ALLOWED: &[(&str, &str, &str, &str, &str, &str, Versions)] = &[
+/// (table, column, field, SQLite, Postgres), why, and `since`, the first
+/// version it holds for. Each suppresses that one difference; one that does
+/// not occur at a version it holds for fails the parity test. Entries have no
+/// end version yet: the first migration that removes a difference here, or
+/// changes or drops an index in `TRANSLATED`, adds one, so older versions keep
+/// their own entries.
+const ALLOWED: &[(&str, &str, &str, &str, &str, &str, i64)] = &[
     (
         "token_balances",
         "token_addr",
@@ -79,7 +61,7 @@ const ALLOWED: &[(&str, &str, &str, &str, &str, &str, Versions)] = &[
         "bytes",
         "text",
         "declared BLOB on SQLite, but every row holds 0x text",
-        Versions::from(1),
+        1,
     ),
     (
         "token_balances",
@@ -88,18 +70,16 @@ const ALLOWED: &[(&str, &str, &str, &str, &str, &str, Versions)] = &[
         "bytes",
         "text",
         "declared BLOB on SQLite, but every row holds 0x text",
-        Versions::from(1),
+        1,
     ),
 ];
 
 /// The expression and partial indexes, which the engines spell differently:
 /// (index, its `sqlite_master.sql` on SQLite, its `pg_get_indexdef` on
-/// Postgres, unqualified, and the versions it holds for). Compared ignoring
-/// case and whitespace outside quotes, each side must match its pin, so a
-/// change to either fails until it is ported to the other. A comment or a
-/// redundant `ASC` in the definition counts as a change too. The version that
-/// changes or drops an index ends its entry there, and pins a changed
-/// definition in a new entry from that version on.
+/// Postgres, unqualified, and `since`, the first version it holds for).
+/// Compared ignoring case and whitespace outside quotes, each side must match
+/// its pin, so a change to either fails until it is ported to the other. A
+/// comment or a redundant `ASC` in the definition counts as a change too.
 const TRANSLATED: &[Pin] = &[(
     "idx_tb_holding",
     "CREATE INDEX idx_tb_holding
@@ -108,10 +88,10 @@ const TRANSLATED: &[Pin] = &[(
     "CREATE INDEX idx_tb_holding ON token_balances USING btree
      (token_addr, length(balance) DESC, balance DESC, holder_addr)
      WHERE (balance !~~ '-%'::text)",
-    Versions::from(1),
+    1,
 )];
 
-type Pin = (&'static str, &'static str, &'static str, Versions);
+type Pin = (&'static str, &'static str, &'static str, i64);
 
 /// Row keys for the tables `SPECS` leaves out, which the round-trip copies too.
 const UNINDEXED: &[Spec] = &[
@@ -825,13 +805,13 @@ fn normalize(sql: &str) -> String {
 }
 
 /// At version `n`: every expression or partial index whose definition on
-/// either side is not the one its pin for `n` holds, or that has no pin or
-/// more than one, and every pin for `n` that names none.
+/// either side is not the one its pin for `n` holds, or that has no pin, and
+/// every pin for `n` that names none.
 fn untranslated(sqlite: &Shape, pg: &Shape, pins: &[Pin], n: i64) -> Vec<String> {
     let definition = |shape: &Shape, name: &str| -> Option<String> {
         shape.indexes.get(name)?.definition.clone()
     };
-    let pins: Vec<&Pin> = pins.iter().filter(|p| p.3.hold_for(n)).collect();
+    let pins: Vec<&Pin> = pins.iter().filter(|p| p.3 <= n).collect();
     let mut out = Vec::new();
     let names: BTreeSet<&String> = sqlite
         .indexes
@@ -848,16 +828,7 @@ fn untranslated(sqlite: &Shape, pg: &Shape, pins: &[Pin], n: i64) -> Vec<String>
             .unwrap()
             .table;
         let what = format!("{table}.index {name}");
-        let mine: Vec<&&Pin> = pins.iter().filter(|p| p.0 == name).collect();
-        if mine.len() > 1 {
-            out.push(format!(
-                "{what}: {} TRANSLATED entries hold for this version; end the old one \
-                 (`until`) where the new one starts",
-                mine.len()
-            ));
-            continue;
-        }
-        let Some(&&&(_, s_pin, p_pin, _)) = mine.first() else {
+        let Some(&&(_, s_pin, p_pin, _)) = pins.iter().find(|p| p.0 == name) else {
             let show = |shape| definition(shape, name).unwrap_or_else(|| "none".into());
             out.push(format!(
                 "{what}: an expression or partial index; pin it in TRANSLATED: SQLite {}, \
@@ -884,97 +855,12 @@ fn untranslated(sqlite: &Shape, pg: &Shape, pins: &[Pin], n: i64) -> Vec<String>
         if definition(sqlite, p.0).is_none() && definition(pg, p.0).is_none() {
             out.push(format!(
                 "TRANSLATED entry {:?} names no expression or partial index; \
-                 start it (`since`) at the version that added the index, or end it \
-                 (`until`) at the one that dropped it",
+                 start it (`since`) at the version that added the index",
                 p.0
             ));
         }
     }
     out
-}
-
-/// A version is held to the pins that hold for it: a pin a later version adds
-/// or replaces says nothing about it, while its own pins still apply.
-#[test]
-fn each_version_is_held_to_its_own_pins() {
-    let index = |definition: &str| Idx {
-        table: "t".into(),
-        unique: false,
-        partial: true,
-        keys: None,
-        definition: Some(definition.into()),
-    };
-    let shape = |defs: &[(&str, &str)]| Shape {
-        indexes: defs
-            .iter()
-            .map(|(n, d)| (n.to_string(), index(d)))
-            .collect(),
-        ..Shape::default()
-    };
-    let (x1, x1_pg) = (
-        "CREATE INDEX ix ON t (a) WHERE a > 0",
-        "CREATE INDEX ix ON t USING btree (a) WHERE (a > 0)",
-    );
-    let (x3, x3_pg) = (
-        "CREATE INDEX ix ON t (a) WHERE a > 1",
-        "CREATE INDEX ix ON t USING btree (a) WHERE (a > 1)",
-    );
-    let (y2, y2_pg) = (
-        "CREATE INDEX iy ON t (b) WHERE b > 0",
-        "CREATE INDEX iy ON t USING btree (b) WHERE (b > 0)",
-    );
-    let pins: &[Pin] = &[
-        (
-            "ix",
-            x1,
-            x1_pg,
-            Versions {
-                since: 1,
-                until: Some(3),
-            },
-        ),
-        ("ix", x3, x3_pg, Versions::from(3)),
-        ("iy", y2, y2_pg, Versions::from(2)),
-    ];
-    let versions = [
-        (1, shape(&[("ix", x1)]), shape(&[("ix", x1_pg)])),
-        (
-            2,
-            shape(&[("ix", x1), ("iy", y2)]),
-            shape(&[("ix", x1_pg), ("iy", y2_pg)]),
-        ),
-        (
-            3,
-            shape(&[("ix", x3), ("iy", y2)]),
-            shape(&[("ix", x3_pg), ("iy", y2_pg)]),
-        ),
-    ];
-    for (n, sqlite, pg) in &versions {
-        assert_eq!(
-            untranslated(sqlite, pg, pins, *n),
-            Vec::<String>::new(),
-            "version {n}"
-        );
-    }
-    // The old pin left open when the new one starts: both hold for 3.
-    let overlapping: &[Pin] = &[("ix", x1, x1_pg, Versions::from(1)), pins[1], pins[2]];
-    let (_, v3, v3_pg) = &versions[2];
-    let found = untranslated(v3, v3_pg, overlapping, 3);
-    assert!(
-        found
-            .iter()
-            .any(|e| e.contains("2 TRANSLATED entries hold")),
-        "{found:?}"
-    );
-    let (_, v1, v1_pg) = &versions[0];
-    let found = untranslated(v1, v1_pg, pins, 3);
-    assert!(
-        found
-            .iter()
-            .any(|e| e.contains("index ix: the SQLite definition differs"))
-            && found.iter().any(|e| e.contains("entry \"iy\" names no")),
-        "version 3's pins still hold version 3 to them: {found:?}"
-    );
 }
 
 #[tokio::test]
@@ -995,7 +881,7 @@ async fn every_version_has_the_same_shape_on_both_backends() {
         let postgres = pg_shape(&mut pg.conn).await;
         let diffs = compare(&sqlite, &postgres);
 
-        let allowed: Vec<_> = ALLOWED.iter().filter(|a| a.6.hold_for(n)).collect();
+        let allowed: Vec<_> = ALLOWED.iter().filter(|a| a.6 <= n).collect();
         let mut problems: Vec<String> = diffs
             .iter()
             .filter(|d| {
@@ -1009,8 +895,7 @@ async fn every_version_has_the_same_shape_on_both_backends() {
             if !diffs.iter().any(|d| d.tuple() == (a.0, a.1, a.2, a.3, a.4)) {
                 problems.push(format!(
                     "ALLOWED entry {:?} matches no difference; start it (`since`) at the \
-                     version that made the difference, or end it (`until`) at the one that \
-                     removed it",
+                     version that made the difference",
                     (a.0, a.1, a.2, a.3, a.4)
                 ));
             }
