@@ -919,7 +919,7 @@ re-derivable and `writer_seq` catches a lost suffix.
 ```mermaid
 stateDiagram-v2
     [*] --> Preflight: open_with (ROLE=indexer or all)
-    Preflight --> Candidate: schema, no gaps, checksums, D ≤ B, indexes valid
+    Preflight --> Candidate: schema, no gaps, checksums, D ≤ B
     Preflight --> [*]: refuse (exit 1, never Ready)
     Candidate --> Candidate: try_lock false, retry every 5 s on the same session
     Candidate --> Leader: try_lock true, self-checks, preflight, migrate, grants
@@ -1196,8 +1196,10 @@ alone still opens the file.
   with a credential-free `PG_TEST_URL` and the variables set.
 
 **Telling a Postgres URL from a SQLite path.** One function,
-`DbTarget::parse`, classifies the argument of `open` and the value of
-`DATABASE_URL`. `DB_PATH` is always a file path and is never classified.
+`DbTarget::parse`, classifies the value of `DATABASE_URL`. `DB_PATH` is
+always a file path and is never classified, and so is the argument of
+`db::open`, which opens SQLite only; tests open Postgres through `open_with`
+and a `DbConfig`.
 
 - **`postgres://…` or `postgresql://…`** is Postgres, as given.
 - **No scheme, in the form `[user[:password]@]host:port[/dbname][?params]`,**
@@ -1524,10 +1526,10 @@ Under `ROLE=web`, `src/follow.rs` runs one task on the read pool:
 - **Rollout.** The three `temp_db` helpers (`decoder.rs:13`, `pages.rs:27`,
   `live_rpc.rs:19`) switch to the shared one in stage 1, SQLite only, and
   gain Postgres in stage 4c.
-- **SQLite-only tests.** The `db::lock` tests in decoder, pages and
-  anchoring open SQLite with `db::open` and a file path, and the tests that
-  call `init_db` directly stay on SQLite too, so the `TEST_DB=postgres` job
-  runs every test in its suites.
+- **SQLite-only tests.** The `db::lock` tests in decoder open SQLite with
+  `db::open` and a file path, and the tests that call `init_db` directly
+  stay on SQLite too, so the `TEST_DB=postgres` job runs every test in its
+  suites.
 - **Backend-neutral rebuild.** The rebuild step of
   `pages.rs::a_genesis_balance_counts_once` gets a backend-neutral copy.
 
