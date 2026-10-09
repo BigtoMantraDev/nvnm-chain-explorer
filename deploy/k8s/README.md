@@ -104,8 +104,8 @@ Prometheus `PodMonitoring`, or any Prometheus). The Ingress must not route it.
 |------------------|-----------------------------------------------------------------------------------|
 | Fetching behind  | `explorer_tip_lag_blocks > M` for T minutes                                       |
 | Not leader       | `explorer_writer_state` is not 1 for 2 min                                        |
-| No heartbeat     | `time() − explorer_writer_last_ok_seconds > 30`                                   |
-| Stale            | `time() − explorer_latest_block_timestamp_seconds > X` for T minutes (web)        |
+| No heartbeat     | `time() - explorer_writer_last_ok_seconds > 30`                                   |
+| Stale            | `time() - explorer_latest_block_timestamp_seconds > X` for T minutes (web)        |
 | 503 rate         | `rate(explorer_http_503_total[5m]) > R` (web)                                     |
 
 `explorer_http_request_duration_seconds` (by route) keeps page p95 visible;
