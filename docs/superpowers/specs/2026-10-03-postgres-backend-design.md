@@ -1,6 +1,6 @@
 # Phase 3: Postgres as a second permanent backend
 
-Status: draft, awaiting review
+Status: implemented
 Date: 2026-10-03
 Follows: `2026-10-01-db-boundary-design.md` (phase 1) and
 `2026-10-02-schema-two-dialects-design.md` (phase 2)

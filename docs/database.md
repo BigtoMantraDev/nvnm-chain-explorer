@@ -185,9 +185,7 @@ way.
 
 Sync upstream through a pull request, not GitHub's "Sync fork" button, which
 pushes straight to `main`, where `docker.yml` publishes `:latest` whether or
-not CI passes. The full recipe is in
-`docs/superpowers/specs/2026-10-01-db-boundary-design.md`. Three checks matter
-for the schema:
+not CI passes. Three checks matter for the schema:
 
 - **Pins A and B** (`src/db/sqlite/migrate.rs`) fail when a merge edits
   `init_db`. Rewrite the change as a migration pair (see "Adding a schema
