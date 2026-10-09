@@ -450,7 +450,7 @@ lock:
 ```rust
 pub(crate) async fn save_block_bundles(p: &PgDb, bundles: &[BlockBundle]) -> Result<()> {
     if bundles.is_empty() { return Ok(()); }
-    let plan = Arc::new(plan::BatchPlan::new(bundles)); // blocks/txs/tokens last-wins; transfers/anchoring first-wins
+    let plan = Arc::new(plan::BatchPlan::new(bundles)); // blocks/txs/tokens last-wins; transfers first-wins; anchoring repeats left to DO NOTHING
     p.writer()?.write(Budget::Batch, move |c| { let plan = plan.clone(); Box::pin(async move {
         let (new_txs, stored): (i64, i64) = q::fetch_one(c, "probe", PROBE, plan.probe_binds()).await?;
         q::exec(c, "blocks", UPSERT_BLOCKS, plan.block_binds()).await?;
@@ -459,8 +459,9 @@ pub(crate) async fn save_block_bundles(p: &PgDb, bundles: &[BlockBundle]) -> Res
         let fresh: Vec<(i64, i64)> = q::fetch_all(c, "transfers", INSERT_TRANSFERS, plan.transfer_binds()).await?;
         q::exec(c, "anchoring", INSERT_ANCHORING, plan.anchoring_binds()).await?;
         q::exec(c, "tokens", UPSERT_TOKENS, plan.token_binds()).await?;   // metadata before balances
-        let old = q::fetch_all(c, "balances", READ_BALANCES, plan.balance_keys(&fresh)).await?;
-        let out = plan.apply(&fresh, old);  // same rule as adjust_balance (db.rs:1169-1206); 0 ⇒ delete
+        let net = plan.net(&fresh);
+        let old = q::fetch_all(c, "balances", READ_BALANCES, net.keys()).await?;
+        let out = plan::apply_deltas(net, &old);  // same rule as adjust_balance (db.rs:1169-1206); 0 ⇒ delete
         q::exec(c, "upsert_bal", UPSERT_BALANCES, out.upserts()).await?;
         q::exec(c, "delete_bal", DELETE_BALANCES, out.deletes()).await?;
         q::exec(c, "holders", BUMP_HOLDERS, out.holder_deltas()).await?;
