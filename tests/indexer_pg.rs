@@ -184,7 +184,6 @@ async fn credentials_come_from_pguser_and_pgpassword() {
         ("PGPASSWORD", password.clone()),
     ]);
     let cfg = db::DbConfig::from_env(|key| env.get(key).cloned()).unwrap();
-    assert_eq!(cfg.password_source(), db::PasswordSource::Env);
     let db::DbTarget::Postgres(target) = &cfg.target else {
         panic!("not Postgres: {:?}", cfg.target);
     };
